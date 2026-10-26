@@ -15,3 +15,6 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # 音声キャプチャ用（まずはScreenCaptureKit、ダメならcpalに切り替え可能）
 screencapturekit = "11.1.0"
 cpal = "0.15"
+
+# 環境変数（.envファイル）の読み込み用
+dotenvy = "0.15"

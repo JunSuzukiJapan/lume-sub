@@ -27,3 +27,13 @@ rustc-ice-*.txt
 # Added by cargo
 
 /target
+
+# ターゲットフォルダ（ビルド成果物）
+/target/
+
+# 💡 環境変数ファイル（絶対にGitに入れない）
+.env
+.env.local
+
+# macOS特有のゴミファイル
+.DS_Store

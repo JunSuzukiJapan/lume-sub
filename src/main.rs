@@ -20,7 +20,8 @@ impl SCStreamOutputTrait for AudioOutputHandler {
         // 音声データが届いた場合のみ処理
         if of_type == SCStreamOutputType::Audio {
             // 💡 画面上の字幕をリアルタイムに更新して、音が拾えていることを視覚的に確認
-            let _ = self.tx.try_send(AppEvent::UpdateSubtitle("🎤 音声データ受信中...".to_string()));
+            // let _ = self.tx.try_send(AppEvent::UpdateSubtitle("🎤 音声データ受信中...".to_string()));
+            let _ = self.tx.try_send(AppEvent::UpdateSubtitle("🎤 Receiving audio data...".to_string()));
             
             // 本番ではここで sample_buffer から PCM（f32配列）を取り出して Meta AI に送ります
         }
@@ -28,6 +29,18 @@ impl SCStreamOutputTrait for AudioOutputHandler {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // 💡 アプリ起動時に .env ファイルから環境変数を読み込む
+    if let Err(e) = dotenvy::dotenv() {
+        println!("⚠️ .env ファイルの読み込みに失敗しました（環境変数から直接読み込みます）: {}", e);
+    }
+
+    // 環境変数からAPIキーとURLを取得して確認（開発中のデバッグ用）
+    let api_key = std::env::var("META_API_KEY").unwrap_or_else(|_| "NOT_FOUND".to_string());
+    let base_url = std::env::var("META_API_BASE_URL").unwrap_or_else(|_| "NOT_FOUND".to_string());
+    println!("🗝️ Meta API Key Loaded: {}", if api_key != "NOT_FOUND" { "OK" } else { "Missing" });
+    println!("🌐 Meta API Base URL: {}", base_url);
+
+    // 1. 非同期処理（tokio）をマルチスレッドモードで起動
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -39,40 +52,58 @@ fn main() -> Result<(), eframe::Error> {
     // 【裏方スレッド：ScreenCaptureKitの初期化と開始】
     let tx_clone = tx.clone();
     rt.spawn(async move {
+        // スレッド内で環境変数を取得
+        let api_key = std::env::var("META_API_KEY").expect("META_API_KEY must be set");
+        let base_url = std::env::var("META_API_BASE_URL").expect("META_API_BASE_URL must be set");
+
+        // HTTPクライアントの作成
+        let client = reqwest::Client::new();
+
         println!("ScreenCaptureKit を初期化中...");
         
-        // 1. キャプチャ可能な対象（画面、ウィンドウ、音声）のリストを取得
-        // 💡 実行時に Mac から「画面収録の許可」を求められるポップアップが出ることがあります
+        // 1. キャプチャ可能な対象のリストを取得
         let content = SCShareableContent::get().expect("コンテンツの一覧取得に失敗");
         
-        // 2. 音声のみをキャプチャする設定を構築
+        // // 2. 音声のみをキャプチャする設定を構築
+        // let mut config = SCStreamConfiguration::default();
+        // config.set_captures_audio(true);
+        // config.set_width(100);
+        // config.set_height(100);
+        // 2. 音声設定を確実に構成する
         let mut config = SCStreamConfiguration::default();
         config.set_captures_audio(true);
-        config.set_width(100);
+        // config.set_excludes_wave_audio(false); // システム全体の音を拾う設定
+        config.set_excludes_current_process_audio(false);
+        config.set_width(100); 
         config.set_height(100);
-        
-        // 3. 画面全体（または特定のアプリ）のフィルターを作成
-        // 今回はシンプルに、メインディスプレイ全体の音声を対象にします
+
+        // 3. 画面全体のフィルターを作成
         let displays = content.displays();
         let display = displays.first().expect("ディスプレイが見つかりません");
         let filter = SCContentFilter::create()
             .with_display(display)
             .with_excluding_windows(&[])
-            .build().expect("cannot create filter");
+            .build()
+            .expect("cannot create filter");
 
         // 4. ストリームの作成
-        // let mut stream = SCStream::new(filter, config);
         let mut stream = SCStream::new(&filter, &config).expect("cannot create stream");
 
-        // 5. コールバック（音声が届いた時の処理）を登録
+        // 5. コールバック（音声用）を登録
         let handler = AudioOutputHandler { tx: tx_clone };
-        // stream.add_output(handler, SCStreamOutputType::Audio);
-        stream.add_output_handler(handler, SCStreamOutputType::Screen);
+        
+        // 💡 修正点：Screen ではなく Audio を指定する
+        stream.add_output_handler(handler, SCStreamOutputType::Audio).expect("cannot add output handler");
 
         // 6. キャプチャ開始
+        // match stream.start_capture() {
+        //     Ok(_) => println!("ScreenCaptureKit によるキャプチャを開始しました！"),
+        //     Err(e) => println!("キャプチャ開始に失敗: {:?}", e),
+        // }
+        // 6. キャプチャ開始のログを詳細にする
         match stream.start_capture() {
-            Ok(_) => println!("ScreenCaptureKit によるキャプチャを開始しました！"),
-            Err(e) => println!("キャプチャ開始に失敗: {:?}", e),
+            Ok(_) => println!("🚀 ScreenCaptureKit: ストリーム正常に開始！"),
+            Err(e) => println!("❌ ScreenCaptureKit: 起動失敗エラー詳細: {:?}", e),
         }
 
         // スレッドが終了しないように維持
@@ -114,6 +145,7 @@ impl LumeSubApp {
         let (tx_internal, rx_internal) = mpsc::channel(100);
         let app = Self {
             subtitle_text: "YouTubeなどを再生して音を鳴らしてください...".to_string(),
+            // subtitle_text: "Play YouTube or some audio...".to_string(),
             receiver: Arc::new(Mutex::new(rx_internal)),
         };
 
