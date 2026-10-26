@@ -1,0 +1,17 @@
+[package]
+name = "lume-sub"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GUIフレームワーク
+eframe = "0.27" # 2026年時点の安定版
+egui = "0.27"
+
+# 非同期ランタイム・通信
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# 音声キャプチャ用（まずはScreenCaptureKit、ダメならcpalに切り替え可能）
+screencapturekit = "11.1.0"
+cpal = "0.15"
