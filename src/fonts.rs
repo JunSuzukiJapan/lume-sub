@@ -36,9 +36,7 @@ impl FontManager {
         &[
             FontCandidate { id: "jp-hiragino", path: "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", scripts: "Japanese", index: 0 },
             FontCandidate { id: "cjk-symbols", path: "/System/Library/Fonts/CJKSymbolsFallback.ttc", scripts: "CJK symbols", index: 0 },
-            FontCandidate { id: "zh-heiti", path: "/System/Library/Fonts/STHeiti Medium.ttc", scripts: "Simplified Chinese", index: 0 },
-            FontCandidate { id: "zh-songti", path: "/System/Library/Fonts/Supplemental/Songti.ttc", scripts: "Chinese", index: 0 },
-            FontCandidate { id: "zh-hiragino-gb", path: "/System/Library/Fonts/Hiragino Sans GB.ttc", scripts: "Simplified Chinese", index: 0 },
+            FontCandidate { id: "zh-heiti", path: "/System/Library/Fonts/STHeiti Medium.ttc", scripts: "Chinese", index: 0 },
             FontCandidate { id: "kr-gothic", path: "/System/Library/Fonts/AppleSDGothicNeo.ttc", scripts: "Korean", index: 0 },
             FontCandidate { id: "th-thonburi", path: "/System/Library/Fonts/ThonburiUI.ttc", scripts: "Thai", index: 0 },
             FontCandidate { id: "ar-geeza", path: "/System/Library/Fonts/GeezaPro.ttc", scripts: "Arabic", index: 0 },
@@ -83,19 +81,20 @@ impl FontManager {
             .collect()
     }
 
-    /// egui にフォントを登録し、フォールバックチェーンを組み立てる
-    pub fn install(&self, ctx: &egui::Context) {
+    /// egui にフォントを登録し、フォールバックチェーンを組み立てる。
+    /// `self` を消費してバイト列をムーブする（大容量のため clone しない）
+    pub fn install(self, ctx: &egui::Context) {
         let mut defs = egui::FontDefinitions::default();
-        for (cand, data) in &self.fonts {
+        let ids: Vec<String> = self.fonts.iter().map(|(c, _)| c.id.to_string()).collect();
+        for (cand, data) in self.fonts {
             defs.font_data.insert(
                 cand.id.to_owned(),
                 egui::FontData {
                     index: cand.index,
-                    ..egui::FontData::from_owned(data.clone())
+                    ..egui::FontData::from_owned(data)
                 },
             );
         }
-        let ids: Vec<String> = self.fonts.iter().map(|(c, _)| c.id.to_string()).collect();
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(chain) = defs.families.get_mut(&family) {
                 *chain = insert_fallbacks(chain, &ids);

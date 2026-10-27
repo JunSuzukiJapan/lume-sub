@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent};
 use control::{CaptureState, PipelineController, SpawnContext, buttons_enabled};
 use language::{Language, LanguageConfig, SharedLanguageConfig, SourceLanguage, shared};
-use translate::{TRANSLATE_MODEL_DEFAULT, translate};
+use translate::{TRANSLATE_MODEL_DEFAULT, TranslationSession};
 
 pub(crate) enum AppEvent {
     UpdateSubtitle(String),
@@ -57,6 +57,10 @@ fn derive_ws_url(base: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // rustls の暗号プロバイダを明示的に選択する。
+    // 依存の features だけでは自動判定できず TLS 初回使用時に panic するため
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // 💡 アプリ起動時に .env ファイルから環境変数を読み込む
     if let Err(e) = dotenvy::dotenv() {
         println!("⚠️ .env ファイルの読み込みに失敗しました（環境変数から直接読み込みます）: {}", e);
@@ -113,6 +117,7 @@ fn main() -> Result<(), eframe::Error> {
         let base = base_url.clone();
         let model = translate_model.clone();
         rt.spawn(async move {
+            let mut session = TranslationSession::default();
             while let Some(event) = asr_rx.recv().await {
                 match event {
                     AsrEvent::Session(id) => {
@@ -131,9 +136,22 @@ fn main() -> Result<(), eframe::Error> {
                         println!("📝 確定#{turn_id}: {transcript}");
                         let _ =
                             gui_tx2.try_send(AppEvent::UpdateSubtitle(transcript.clone()));
-                        let target =
-                            langs.lock().map(|c| c.target).unwrap_or(Language::Japanese);
-                        match translate(&client, &base, &cfg.api_key, &model, &target, &transcript)
+                        let pair =
+                            langs.lock().map(|c| c.clone()).unwrap_or_default();
+                        if !pair.needs_translation() {
+                            println!("⏭️ 同一言語のため翻訳スキップ#{turn_id}");
+                            continue;
+                        }
+                        match session
+                            .translate_next(
+                                &client,
+                                &base,
+                                &cfg.api_key,
+                                &model,
+                                &pair.source,
+                                &pair.target,
+                                &transcript,
+                            )
                             .await
                         {
                             Ok(ja) => {

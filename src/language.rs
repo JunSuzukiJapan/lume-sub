@@ -232,6 +232,14 @@ impl LanguageConfig {
         }
     }
 
+    /// 翻訳APIを呼ぶ必要があるか。入力と出力が明示的に同じ言語なら不要
+    pub fn needs_translation(&self) -> bool {
+        match self.source {
+            SourceLanguage::Auto => true,
+            SourceLanguage::Specific(s) => s != self.target,
+        }
+    }
+
     /// ログ・字幕用の短い表記（例: `auto → 日本語`）
     pub fn describe(&self) -> String {
         let src = match self.source {
@@ -297,5 +305,20 @@ mod tests {
     #[test]
     fn describe_format() {
         assert_eq!(LanguageConfig::default().describe(), "auto → 日本語");
+    }
+
+    #[test]
+    fn same_language_needs_no_translation() {
+        let same = LanguageConfig {
+            source: SourceLanguage::Specific(Language::Japanese),
+            target: Language::Japanese,
+        };
+        assert!(!same.needs_translation());
+        assert!(LanguageConfig::default().needs_translation());
+        let diff = LanguageConfig {
+            source: SourceLanguage::Specific(Language::English),
+            target: Language::Japanese,
+        };
+        assert!(diff.needs_translation());
     }
 }
