@@ -1,35 +1,40 @@
-//! Chat Completions による字幕翻訳（原文 → 日本語）
+//! Chat Completions による字幕翻訳
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::language::Language;
+
 pub const TRANSLATE_MODEL_DEFAULT: &str = "muse-spark-1.3";
 
 #[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
     temperature: f32,
     max_tokens: u32,
 }
 
 #[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+struct ChatMessage {
+    role: String,
+    content: String,
 }
 
-pub fn chat_request_json(model: &str, text: &str) -> String {
+pub fn chat_request_json(model: &str, text: &str, target: &Language) -> String {
+    let name = target.api_name();
     serde_json::to_string(&ChatRequest {
-        model,
+        model: model.to_string(),
         messages: vec![
             ChatMessage {
-                role: "system",
-                content: "You translate video subtitles into Japanese. Output only the Japanese translation, no explanations, no quotation marks.",
+                role: "system".to_string(),
+                content: format!(
+                    "You translate video subtitles into {name}. Output only the {name} translation, no explanations, no quotation marks."
+                ),
             },
             ChatMessage {
-                role: "user",
-                content: text,
+                role: "user".to_string(),
+                content: text.to_string(),
             },
         ],
         temperature: 0.0,
@@ -65,11 +70,12 @@ pub fn parse_chat_content(body: &str) -> Result<String, String> {
     Ok(content)
 }
 
-pub async fn translate_to_japanese(
+pub async fn translate(
     client: &Client,
     base_url: &str,
     api_key: &str,
     model: &str,
+    target: &Language,
     text: &str,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -77,7 +83,7 @@ pub async fn translate_to_japanese(
         .post(&url)
         .bearer_auth(api_key)
         .header("Content-Type", "application/json")
-        .body(chat_request_json(model, text))
+        .body(chat_request_json(model, text, target))
         .send()
         .await
         .map_err(|e| format!("translate request failed: {e}"))?;
@@ -96,9 +102,10 @@ mod tests {
     #[test]
     fn request_shape() {
         let v: serde_json::Value =
-            serde_json::from_str(&chat_request_json("m1", "Hello")).unwrap();
+            serde_json::from_str(&chat_request_json("m1", "Hello", &Language::Japanese)).unwrap();
         assert_eq!(v["model"], "m1");
         assert_eq!(v["messages"][0]["role"], "system");
+        assert!(v["messages"][0]["content"].as_str().unwrap().contains("Japanese"));
         assert_eq!(v["messages"][1]["content"], "Hello");
         assert_eq!(v["temperature"], 0.0);
     }

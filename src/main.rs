@@ -1,66 +1,22 @@
 mod asr;
 mod audio;
+mod control;
 mod fonts;
+mod language;
 mod translate;
 
 use eframe::egui;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-// ScreenCaptureKit 関連のインポート
-use screencapturekit::prelude::*;
+use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent};
+use control::{CaptureState, PipelineController, SpawnContext, buttons_enabled};
+use language::{Language, LanguageConfig, SharedLanguageConfig, SourceLanguage, shared};
+use translate::{TRANSLATE_MODEL_DEFAULT, translate};
 
-use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent, supervise};
-use audio::{AudioFrame, extract_audio_frame, format_audio_status};
-use translate::{TRANSLATE_MODEL_DEFAULT, translate_to_japanese};
-
-enum AppEvent {
+pub(crate) enum AppEvent {
     UpdateSubtitle(String),
-}
-
-// ScreenCaptureKit から音声データが届いたときに呼ばれる構造体
-struct AudioOutputHandler {
-    gui_tx: mpsc::Sender<AppEvent>,
-    audio_tx: mpsc::Sender<AudioFrame>,
-    counter: AtomicUsize,
-    /// ASRが有効ならレベル表示を間引く（字幕は文字起こし優先）
-    asr_enabled: bool,
-}
-
-impl SCStreamOutputTrait for AudioOutputHandler {
-    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
-        if of_type != SCStreamOutputType::Audio {
-            return;
-        }
-        let frame = match extract_audio_frame(&sample_buffer) {
-            Ok(frame) => frame,
-            Err(reason) => {
-                let _ = self.gui_tx.try_send(AppEvent::UpdateSubtitle(format!(
-                    "⚠️ 音声フォーマット未対応: {reason}"
-                )));
-                return;
-            }
-        };
-
-        let count = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-        // ASR無効時のみレベルメーターを表示（有効時は文字起こし・翻訳が字幕を取る）
-        if !self.asr_enabled && count % 20 == 1 {
-            let status = format_audio_status(
-                frame.sample_rate,
-                frame.channels,
-                frame.samples.len(),
-                frame.rms,
-                count,
-            );
-            let _ = self.gui_tx.try_send(AppEvent::UpdateSubtitle(status));
-        }
-        // 満杯なら破棄（リアルタイム優先）
-        let _ = self.audio_tx.try_send(frame);
-    }
 }
 
 fn resolve_api_key() -> Option<String> {
@@ -115,8 +71,11 @@ fn main() -> Result<(), eframe::Error> {
         if api_key.is_some() { "OK" } else { "Missing（ASR・翻訳なし）" }
     );
     println!("🌐 API Base URL: {base_url}");
+    let lang_config = LanguageConfig::from_env();
+    println!("🈯 言語: {}", lang_config.describe());
+    let languages = shared(lang_config);
 
-    // 1. 非同期処理（tokio）をマルチスレッドモードで起動
+    // 非同期処理（tokio）をマルチスレッドモードで起動
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -124,123 +83,83 @@ fn main() -> Result<(), eframe::Error> {
 
     let tokio_handle = rt.handle().clone();
     let (gui_tx, gui_rx) = mpsc::channel::<AppEvent>(100);
-    let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(200);
     let (asr_tx, mut asr_rx) = mpsc::channel::<AsrEvent>(100);
 
-    // ASR・翻訳パイプライン（APIキーがある場合のみ）
-    let asr_enabled = match (api_key.clone(), derive_ws_url(&base_url)) {
+    let asr_config = match (api_key, derive_ws_url(&base_url)) {
         (Some(key), Ok(ws_url)) => {
             println!("🔌 ASR接続先: {ws_url}（model={asr_model}）");
-            let cfg = AsrConfig {
+            Some(AsrConfig {
                 ws_url,
-                api_key: key.clone(),
+                api_key: key,
                 model: asr_model,
-            };
-            rt.spawn(supervise(audio_rx, asr_tx, cfg));
-
-            // ASRイベント → 翻訳 → 字幕（順序保持のため逐次処理）
-            let gui_tx2 = gui_tx.clone();
-            let client = reqwest::Client::new();
-            rt.spawn(async move {
-                while let Some(event) = asr_rx.recv().await {
-                    match event {
-                        AsrEvent::Session(id) => {
-                            println!("✅ ASRセッション開始: {id}");
-                            let _ = gui_tx2
-                                .try_send(AppEvent::UpdateSubtitle(
-                                    "🎧 音声を聞き取り中...".to_string(),
-                                ));
-                        }
-                        AsrEvent::Partial(text) => {
-                            let _ = gui_tx2.try_send(AppEvent::UpdateSubtitle(format!("{text} …")));
-                        }
-                        AsrEvent::Complete { turn_id, transcript } => {
-                            println!("📝 確定#{turn_id}: {transcript}");
-                            let _ = gui_tx2
-                                .try_send(AppEvent::UpdateSubtitle(transcript.clone()));
-                            match translate_to_japanese(
-                                &client,
-                                &base_url,
-                                &key,
-                                &translate_model,
-                                &transcript,
-                            )
-                            .await
-                            {
-                                Ok(ja) => {
-                                    println!("🇯🇵 翻訳#{turn_id}: {ja}");
-                                    let _ = gui_tx2.try_send(AppEvent::UpdateSubtitle(ja));
-                                }
-                                Err(e) => println!("⚠️ 翻訳失敗#{turn_id}: {e}"),
-                            }
-                        }
-                        AsrEvent::Error(e) => println!("⚠️ ASRエラー: {e}"),
-                    }
-                }
-            });
-            true
+            })
         }
         (Some(_), Err(e)) => {
             println!("⚠️ {e}（ASR・翻訳なし）");
-            false
+            None
         }
         (None, _) => {
             println!("⚠️ APIキー未設定のためASR・翻訳は無効です（レベル表示のみ）");
-            false
+            None
         }
     };
+    let asr_enabled = asr_config.is_some();
 
-    // 【裏方スレッド：ScreenCaptureKitの初期化と開始】
-    let tx_clone = gui_tx.clone();
-    rt.spawn(async move {
-        println!("ScreenCaptureKit を初期化中...");
+    // ASRイベント → 翻訳 → 字幕（順序保持のため逐次処理）
+    if let Some(cfg) = asr_config.clone() {
+        let gui_tx2 = gui_tx.clone();
+        let client = reqwest::Client::new();
+        let langs = languages.clone();
+        let base = base_url.clone();
+        let model = translate_model.clone();
+        rt.spawn(async move {
+            while let Some(event) = asr_rx.recv().await {
+                match event {
+                    AsrEvent::Session(id) => {
+                        println!("✅ ASRセッション開始: {id}");
+                        let pair = langs
+                            .lock()
+                            .map(|c| c.describe())
+                            .unwrap_or_else(|_| "?".to_string());
+                        let _ = gui_tx2
+                            .try_send(AppEvent::UpdateSubtitle(format!("🎧 {pair} 聞き取り中...")));
+                    }
+                    AsrEvent::Partial(text) => {
+                        let _ = gui_tx2.try_send(AppEvent::UpdateSubtitle(format!("{text} …")));
+                    }
+                    AsrEvent::Complete { turn_id, transcript } => {
+                        println!("📝 確定#{turn_id}: {transcript}");
+                        let _ =
+                            gui_tx2.try_send(AppEvent::UpdateSubtitle(transcript.clone()));
+                        let target =
+                            langs.lock().map(|c| c.target).unwrap_or(Language::Japanese);
+                        match translate(&client, &base, &cfg.api_key, &model, &target, &transcript)
+                            .await
+                        {
+                            Ok(ja) => {
+                                println!("🌐 翻訳#{turn_id}: {ja}");
+                                let _ = gui_tx2.try_send(AppEvent::UpdateSubtitle(ja));
+                            }
+                            Err(e) => println!("⚠️ 翻訳失敗#{turn_id}: {e}"),
+                        }
+                    }
+                    AsrEvent::Error(e) => println!("⚠️ ASRエラー: {e}"),
+                }
+            }
+        });
+    }
 
-        // 1. キャプチャ可能な対象のリストを取得
-        let content = SCShareableContent::get().expect("コンテンツの一覧取得に失敗");
-
-        // 2. 音声設定を確実に構成する
-        let mut config = SCStreamConfiguration::default();
-        config.set_captures_audio(true);
-        config.set_sample_rate(48_000);
-        config.set_channel_count(2);
-        config.set_excludes_current_process_audio(false);
-        config.set_width(100);
-        config.set_height(100);
-
-        // 3. 画面全体のフィルターを作成
-        let displays = content.displays();
-        let display = displays.first().expect("ディスプレイが見つかりません");
-        let filter = SCContentFilter::create()
-            .with_display(display)
-            .with_excluding_windows(&[])
-            .build()
-            .expect("cannot create filter");
-
-        // 4. ストリームの作成
-        let mut stream = SCStream::new(&filter, &config).expect("cannot create stream");
-
-        // 5. コールバック（音声用）を登録
-        let handler = AudioOutputHandler {
-            gui_tx: tx_clone,
-            audio_tx,
-            counter: AtomicUsize::new(0),
-            asr_enabled,
-        };
-        stream.add_output_handler(handler, SCStreamOutputType::Audio).expect("cannot add output handler");
-
-        // 6. キャプチャ開始のログを詳細にする
-        match stream.start_capture() {
-            Ok(_) => println!("🚀 ScreenCaptureKit: ストリーム正常に開始！"),
-            Err(e) => println!("❌ ScreenCaptureKit: 起動失敗エラー詳細: {:?}", e),
-        }
-
-        // スレッドが終了しないように維持
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+    // パイプライン制御（起動時は自動開始）
+    let controller = PipelineController::new(SpawnContext {
+        tokio: tokio_handle.clone(),
+        gui_tx,
+        asr_tx,
+        asr_config,
+        langs: languages.clone(),
     });
+    controller.start();
 
-    // GUI（egui）のウィンドウ設定
+    // GUI（egui）のウィンドウ設定：字幕オーバーレイ
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
@@ -271,14 +190,33 @@ fn main() -> Result<(), eframe::Error> {
                 gui_rx,
                 tokio_handle,
                 initial_text,
+                controller,
+                languages,
             ))
         }),
     )
 }
 
+fn status_label(status: CaptureState) -> &'static str {
+    match status {
+        CaptureState::Stopped => "⏹ 停止中",
+        CaptureState::Running => "▶ 動作中",
+        CaptureState::Paused => "⏸ 一時停止中",
+    }
+}
+
+fn source_label(source: SourceLanguage) -> String {
+    match source {
+        SourceLanguage::Auto => "auto（自動検出）".to_string(),
+        SourceLanguage::Specific(l) => format!("{} ({})", l.display_name(), l.code()),
+    }
+}
+
 struct LumeSubApp {
     subtitle_text: String,
     receiver: Arc<Mutex<mpsc::Receiver<AppEvent>>>,
+    controller: PipelineController,
+    langs: SharedLanguageConfig,
 }
 
 impl LumeSubApp {
@@ -287,11 +225,15 @@ impl LumeSubApp {
         mut rx: mpsc::Receiver<AppEvent>,
         handle: Handle,
         initial_text: String,
+        controller: PipelineController,
+        langs: SharedLanguageConfig,
     ) -> Self {
         let (tx_internal, rx_internal) = mpsc::channel(100);
         let app = Self {
             subtitle_text: initial_text,
             receiver: Arc::new(Mutex::new(rx_internal)),
+            controller,
+            langs,
         };
 
         let receiver_ctx = ctx.clone();
@@ -303,6 +245,74 @@ impl LumeSubApp {
         });
 
         app
+    }
+
+    /// 操作ウィンドウ（字幕オーバーレイはマウス透過のため入力はここで受ける）
+    fn control_ui(&self, ui: &mut egui::Ui) {
+        ui.heading("LumeSub");
+        ui.label(format!("状態: {}", status_label(self.controller.status())));
+        ui.separator();
+
+        if let Ok(mut langs) = self.langs.lock() {
+            egui::ComboBox::from_label("入力言語")
+                .selected_text(source_label(langs.source))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut langs.source, SourceLanguage::Auto, "auto（自動検出）");
+                    for l in Language::all() {
+                        ui.selectable_value(
+                            &mut langs.source,
+                            SourceLanguage::Specific(*l),
+                            format!("{} ({})", l.display_name(), l.code()),
+                        );
+                    }
+                });
+            egui::ComboBox::from_label("出力言語")
+                .selected_text(langs.target.display_name())
+                .show_ui(ui, |ui| {
+                    for l in Language::all() {
+                        ui.selectable_value(
+                            &mut langs.target,
+                            *l,
+                            format!("{} ({})", l.display_name(), l.code()),
+                        );
+                    }
+                });
+            ui.label(format!("設定: {}", langs.describe()));
+        } else {
+            ui.colored_label(egui::Color32::RED, "言語設定の読み取りに失敗");
+        }
+        ui.small("※ 入力言語は次回接続から反映（Stop→Start）");
+        ui.separator();
+
+        let status = self.controller.status();
+        let (can_start, can_pause, can_stop) = buttons_enabled(status);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(can_start, egui::Button::new("▶ Start")).clicked() {
+                self.controller.start();
+            }
+            let pause_label = if status == CaptureState::Paused {
+                "▶ Resume"
+            } else {
+                "⏸ Pause"
+            };
+            if ui.add_enabled(can_pause, egui::Button::new(pause_label)).clicked() {
+                if status == CaptureState::Paused {
+                    self.controller.start();
+                } else {
+                    self.controller.pause();
+                }
+            }
+            if ui.add_enabled(can_stop, egui::Button::new("⏹ Stop")).clicked() {
+                self.controller.stop();
+            }
+            if ui.button("⏻ Quit").clicked() {
+                self.controller.stop();
+                ui.ctx().send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Close,
+                );
+            }
+        });
     }
 }
 
@@ -332,6 +342,19 @@ impl eframe::App for LumeSubApp {
                 );
             });
         });
+
+        // 操作ウィンドウは常時表示（閉じても次フレームで復活する）
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("lume-sub-control"),
+            egui::ViewportBuilder::default()
+                .with_title("LumeSub Control")
+                .with_inner_size([320.0, 400.0]),
+            |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.control_ui(ui);
+                });
+            },
+        );
     }
 }
 

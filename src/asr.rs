@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::audio::{AudioFrame, f32_to_pcm16le_bytes, resample_48k_to_24k};
+use crate::language::SharedLanguageConfig;
 
 pub const ASR_MODEL_DEFAULT: &str = "muse-voice-transcribe-1.0";
 const EXPECTED_INPUT_RATE: u32 = 48_000;
@@ -20,6 +21,7 @@ const FRAME_SAMPLES_24K: usize = 24_000 * FRAME_MS as usize / 1000; // 1920
 const FRAME_BYTES: usize = FRAME_SAMPLES_24K * 2; // 3840
 const SILENCE_FRAME: [u8; FRAME_BYTES] = [0u8; FRAME_BYTES];
 
+#[derive(Clone)]
 pub struct AsrConfig {
     pub ws_url: String,
     pub api_key: String,
@@ -59,6 +61,8 @@ struct Handshake<'a> {
     partial_mode: &'static str,
     #[serde(rename = "emitAudioProgress")]
     emit_audio_progress: bool,
+    #[serde(rename = "languageBias", skip_serializing_if = "Option::is_none")]
+    language_bias: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -67,7 +71,7 @@ struct Auth<'a> {
     access_token: &'a str,
 }
 
-fn handshake_json(api_key: &str, model: &str) -> String {
+fn handshake_json(api_key: &str, model: &str, language_bias: Option<Vec<String>>) -> String {
     let token = format!("Bearer {api_key}");
     serde_json::to_string(&Handshake {
         authorization: Auth {
@@ -78,6 +82,7 @@ fn handshake_json(api_key: &str, model: &str) -> String {
         mode: "ENDPOINTING",
         partial_mode: "CUMULATIVE",
         emit_audio_progress: false,
+        language_bias,
     })
     .expect("handshake serialization")
 }
@@ -136,6 +141,7 @@ pub async fn run_session(
     audio_rx: &mut mpsc::Receiver<AudioFrame>,
     event_tx: &mpsc::Sender<AsrEvent>,
     cfg: &AsrConfig,
+    langs: &SharedLanguageConfig,
 ) -> SessionEnd {
     let (ws, _) = match connect_async(&cfg.ws_url).await {
         Ok(v) => v,
@@ -144,7 +150,8 @@ pub async fn run_session(
     let (mut sink, mut stream) = ws.split();
 
     // 1. ハンドシェイク（最初の JSON テキストフレーム）
-    if let Err(e) = sink.send(Message::Text(handshake_json(&cfg.api_key, &cfg.model).into())).await {
+    let bias = langs.lock().ok().and_then(|c| c.language_bias());
+    if let Err(e) = sink.send(Message::Text(handshake_json(&cfg.api_key, &cfg.model, bias).into())).await {
         return SessionEnd::TransportError(format!("handshake send failed: {e}"));
     }
     // 2. ack を待ってから音声送信開始
@@ -279,10 +286,11 @@ pub async fn supervise(
     mut audio_rx: mpsc::Receiver<AudioFrame>,
     event_tx: mpsc::Sender<AsrEvent>,
     cfg: AsrConfig,
+    langs: SharedLanguageConfig,
 ) {
     let mut backoff_secs = 2u64;
     loop {
-        match run_session(&mut audio_rx, &event_tx, &cfg).await {
+        match run_session(&mut audio_rx, &event_tx, &cfg, &langs).await {
             SessionEnd::InputClosed => return,
             SessionEnd::ServerClose { code: Some(1000) } => return,
             SessionEnd::ServerClose { code: Some(1008) } => {
@@ -312,13 +320,25 @@ mod tests {
     #[test]
     fn handshake_shape_matches_docs() {
         let v: serde_json::Value =
-            serde_json::from_str(&handshake_json("KEY123", "muse-voice-transcribe-1.0")).unwrap();
+            serde_json::from_str(&handshake_json("KEY123", "muse-voice-transcribe-1.0", None)).unwrap();
         assert_eq!(v["authorization"]["accessToken"], "Bearer KEY123");
         assert_eq!(v["audioEncoding"], "PCM_24KHZ");
         assert_eq!(v["model"], "muse-voice-transcribe-1.0");
         assert_eq!(v["mode"], "ENDPOINTING");
         assert_eq!(v["partialMode"], "CUMULATIVE");
         assert_eq!(v["emitAudioProgress"], false);
+        assert!(v.get("languageBias").is_none());
+    }
+
+    #[test]
+    fn handshake_carries_language_bias() {
+        let v: serde_json::Value = serde_json::from_str(&handshake_json(
+            "KEY123",
+            "muse-voice-transcribe-1.0",
+            Some(vec!["English".to_string()]),
+        ))
+        .unwrap();
+        assert_eq!(v["languageBias"], serde_json::json!(["English"]));
     }
 
     #[test]
