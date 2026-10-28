@@ -4,6 +4,7 @@ mod control;
 mod fonts;
 mod geometry;
 mod hover;
+mod i18n;
 mod language;
 mod text;
 mod translate;
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 
 use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent};
 use control::{CaptureState, PipelineController, SpawnContext, buttons_enabled};
+use i18n::{SharedUiLocale, UiLocale, UiStrings};
 use language::{Language, LanguageConfig, SharedLanguageConfig, SourceLanguage, shared};
 use text::shape_for_display;
 use translate::{TRANSLATE_MODEL_DEFAULT, TranslationSession};
@@ -82,6 +84,18 @@ fn main() -> Result<(), eframe::Error> {
     let lang_config = LanguageConfig::from_env();
     println!("🈯 言語: {}", lang_config.describe());
     let languages = shared(lang_config);
+    let locale_path = i18n::default_path();
+    let ui_locale = locale_path
+        .as_deref()
+        .and_then(i18n::load)
+        .or_else(UiLocale::from_env)
+        .unwrap_or_default();
+    println!(
+        "🗣️ 表示言語: {} ({})",
+        ui_locale.display_name(),
+        ui_locale.code()
+    );
+    let ui_locales = i18n::shared(ui_locale);
 
     // 非同期処理（tokio）をマルチスレッドモードで起動
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -118,6 +132,7 @@ fn main() -> Result<(), eframe::Error> {
         let gui_tx2 = gui_tx.clone();
         let client = reqwest::Client::new();
         let langs = languages.clone();
+        let ui_langs = ui_locales.clone();
         let base = base_url.clone();
         let model = translate_model.clone();
         rt.spawn(async move {
@@ -130,8 +145,13 @@ fn main() -> Result<(), eframe::Error> {
                             .lock()
                             .map(|c| c.describe())
                             .unwrap_or_else(|_| "?".to_string());
-                        let _ = gui_tx2
-                            .try_send(AppEvent::UpdateSubtitle(format!("🎧 {pair} 聞き取り中...")));
+                        let text = ui_langs
+                            .lock()
+                            .map(|l| l.strings().listening_text(&pair))
+                            .unwrap_or_else(|_| {
+                                UiLocale::default().strings().listening_text(&pair)
+                            });
+                        let _ = gui_tx2.try_send(AppEvent::UpdateSubtitle(text));
                     }
                     AsrEvent::Partial(text) => {
                         let _ = gui_tx2.try_send(AppEvent::UpdateSubtitle(format!("{text} …")));
@@ -178,6 +198,7 @@ fn main() -> Result<(), eframe::Error> {
         asr_tx,
         asr_config,
         langs: languages.clone(),
+        ui_locale: ui_locales.clone(),
     });
     controller.start();
 
@@ -206,10 +227,13 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
-    let initial_text = if asr_enabled {
-        "ASRに接続中...".to_string()
-    } else {
-        "YouTubeなどを再生して音を鳴らしてください...".to_string()
+    let initial_text = {
+        let t = ui_locale.strings();
+        if asr_enabled {
+            t.connecting.to_string()
+        } else {
+            t.play_prompt.to_string()
+        }
     };
     eframe::run_native(
         "LumeSub",
@@ -228,6 +252,8 @@ fn main() -> Result<(), eframe::Error> {
                 initial_text,
                 controller,
                 languages,
+                ui_locales.clone(),
+                locale_path.clone(),
                 geom_path.clone(),
                 restored,
             ))
@@ -235,17 +261,17 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-fn status_label(status: CaptureState) -> &'static str {
+fn status_label(status: CaptureState, t: &UiStrings) -> &'static str {
     match status {
-        CaptureState::Stopped => "⏹ 停止中",
-        CaptureState::Running => "▶ 動作中",
-        CaptureState::Paused => "⏸ 一時停止中",
+        CaptureState::Stopped => t.status_stopped,
+        CaptureState::Running => t.status_running,
+        CaptureState::Paused => t.status_paused,
     }
 }
 
-fn source_label(source: SourceLanguage) -> String {
+fn source_label(source: SourceLanguage, t: &UiStrings) -> String {
     match source {
-        SourceLanguage::Auto => "auto（自動検出）".to_string(),
+        SourceLanguage::Auto => t.auto_detect.to_string(),
         SourceLanguage::Specific(l) => format!("{} ({})", l.display_name(), l.code()),
     }
 }
@@ -255,6 +281,8 @@ struct LumeSubApp {
     receiver: Arc<Mutex<mpsc::Receiver<AppEvent>>>,
     controller: PipelineController,
     langs: SharedLanguageConfig,
+    ui_locale: SharedUiLocale,
+    locale_path: Option<std::path::PathBuf>,
     hover: hover::HoverState,
     geom: geometry::GeometrySaver,
     placed_initial: bool,
@@ -271,6 +299,8 @@ impl LumeSubApp {
         initial_text: String,
         controller: PipelineController,
         langs: SharedLanguageConfig,
+        ui_locale: SharedUiLocale,
+        locale_path: Option<std::path::PathBuf>,
         geom_path: Option<std::path::PathBuf>,
         restored: bool,
     ) -> Self {
@@ -280,6 +310,8 @@ impl LumeSubApp {
             receiver: Arc::new(Mutex::new(rx_internal)),
             controller,
             langs,
+            ui_locale,
+            locale_path,
             hover: hover::HoverState::new(),
             geom: geometry::GeometrySaver::new(geom_path),
             placed_initial: restored,
@@ -299,15 +331,17 @@ impl LumeSubApp {
 
     /// 操作ウィンドウ（字幕オーバーレイはマウス透過のため入力はここで受ける）
     fn control_ui(&self, ui: &mut egui::Ui) {
+        let locale = self.ui_locale.lock().map(|l| *l).unwrap_or_default();
+        let t = locale.strings();
         ui.heading("LumeSub");
-        ui.label(format!("状態: {}", status_label(self.controller.status())));
+        ui.label(t.status_line(status_label(self.controller.status(), t)));
         ui.separator();
 
         if let Ok(mut langs) = self.langs.lock() {
-            egui::ComboBox::from_label("入力言語")
-                .selected_text(shape_for_display(&source_label(langs.source)).into_owned())
+            egui::ComboBox::from_label(t.input_language)
+                .selected_text(shape_for_display(&source_label(langs.source, t)).into_owned())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut langs.source, SourceLanguage::Auto, "auto（自動検出）");
+                    ui.selectable_value(&mut langs.source, SourceLanguage::Auto, t.auto_detect);
                     for l in Language::all() {
                         ui.selectable_value(
                             &mut langs.source,
@@ -317,7 +351,7 @@ impl LumeSubApp {
                         );
                     }
                 });
-            egui::ComboBox::from_label("出力言語")
+            egui::ComboBox::from_label(t.output_language)
                 .selected_text(shape_for_display(langs.target.display_name()).into_owned())
                 .show_ui(ui, |ui| {
                     for l in Language::all() {
@@ -329,23 +363,48 @@ impl LumeSubApp {
                         );
                     }
                 });
-            ui.label(shape_for_display(&format!("設定: {}", langs.describe())).into_owned());
+            ui.label(shape_for_display(&t.settings_line(&langs.describe())).into_owned());
         } else {
-            ui.colored_label(egui::Color32::RED, "言語設定の読み取りに失敗");
+            ui.colored_label(egui::Color32::RED, t.lang_read_failed);
         }
-        ui.small("※ 入力言語は次回接続から反映（Stop→Start）");
+        ui.small(t.input_note);
+        ui.separator();
+
+        // 表示言語の切替。変えたら即保存する
+        if let Ok(mut current) = self.ui_locale.lock() {
+            let before = *current;
+            egui::ComboBox::from_label(current.strings().display_language)
+                .selected_text(current.display_name())
+                .show_ui(ui, |ui| {
+                    for l in UiLocale::all() {
+                        ui.selectable_value(&mut *current, *l, l.display_name());
+                    }
+                });
+            if *current != before {
+                println!(
+                    "🗣️ 表示言語: {} ({})",
+                    current.display_name(),
+                    current.code()
+                );
+                if let Some(path) = &self.locale_path
+                    && let Err(e) = i18n::save(path, *current)
+                {
+                    println!("⚠️ 表示言語の保存に失敗: {e}");
+                }
+            }
+        }
         ui.separator();
 
         let status = self.controller.status();
         let (can_start, can_pause, can_stop) = buttons_enabled(status);
         ui.horizontal(|ui| {
-            if ui.add_enabled(can_start, egui::Button::new("▶ Start")).clicked() {
+            if ui.add_enabled(can_start, egui::Button::new(t.start)).clicked() {
                 self.controller.start();
             }
             let pause_label = if status == CaptureState::Paused {
-                "▶ Resume"
+                t.resume
             } else {
-                "⏸ Pause"
+                t.pause
             };
             if ui.add_enabled(can_pause, egui::Button::new(pause_label)).clicked() {
                 if status == CaptureState::Paused {
@@ -354,10 +413,10 @@ impl LumeSubApp {
                     self.controller.pause();
                 }
             }
-            if ui.add_enabled(can_stop, egui::Button::new("⏹ Stop")).clicked() {
+            if ui.add_enabled(can_stop, egui::Button::new(t.stop)).clicked() {
                 self.controller.stop();
             }
-            if ui.button("⏻ Quit").clicked() {
+            if ui.button(t.quit).clicked() {
                 self.controller.stop();
                 ui.ctx().send_viewport_cmd_to(
                     egui::ViewportId::ROOT,
@@ -367,7 +426,7 @@ impl LumeSubApp {
         });
         ui.separator();
         // 保存した画面外位置などに迷子になった場合の救済
-        if ui.button("字幕位置をリセット").clicked()
+        if ui.button(t.reset_position).clicked()
             && let Some(monitor) = ui.ctx().input(|i| i.viewport().monitor_size)
         {
             let size = egui::vec2(geometry::DEFAULT_W, geometry::DEFAULT_H);
@@ -452,7 +511,12 @@ impl eframe::App for LumeSubApp {
                 );
             });
             if interactive {
-                hover::paint_frame(ui);
+                let drag = self
+                    .ui_locale
+                    .lock()
+                    .map(|l| l.strings().drag_to_move)
+                    .unwrap_or_else(|_| UiLocale::default().strings().drag_to_move);
+                hover::paint_frame(ui, drag);
             }
         });
 
@@ -464,11 +528,16 @@ impl eframe::App for LumeSubApp {
         }
 
         // 操作ウィンドウは常時表示（閉じても次フレームで復活する）
+        let control_title = self
+            .ui_locale
+            .lock()
+            .map(|l| l.strings().control_title)
+            .unwrap_or_else(|_| UiLocale::default().strings().control_title);
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("lume-sub-control"),
             egui::ViewportBuilder::default()
-                .with_title("LumeSub Control")
-                .with_inner_size([320.0, 400.0]),
+                .with_title(control_title)
+                .with_inner_size([320.0, 440.0]),
             |ctx, _class| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.control_ui(ui);

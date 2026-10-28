@@ -97,7 +97,7 @@ impl HoverState {
 }
 
 /// 移動ストリップ＋リサイズグリップ付きの枠を描く。レイアウトには影響しない
-pub fn paint_frame(ui: &mut egui::Ui) {
+pub fn paint_frame(ui: &mut egui::Ui, drag_label: &str) {
     let rect = ui.max_rect();
     let painter = ui.painter();
     let bright = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140);
@@ -114,7 +114,7 @@ pub fn paint_frame(ui: &mut egui::Ui) {
     painter.text(
         strip.center(),
         egui::Align2::CENTER_CENTER,
-        "drag to move",
+        drag_label,
         egui::FontId::proportional(11.0),
         dim,
     );
