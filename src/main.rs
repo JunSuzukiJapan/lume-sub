@@ -6,6 +6,7 @@ mod geometry;
 mod hover;
 mod i18n;
 mod language;
+mod screen;
 mod text;
 mod translate;
 
@@ -18,6 +19,7 @@ use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent};
 use control::{CaptureState, PipelineController, SpawnContext, buttons_enabled};
 use i18n::{SharedUiLocale, UiLocale, UiStrings};
 use language::{Language, LanguageConfig, SharedLanguageConfig, SourceLanguage, shared};
+use screen::{DiagLog, Settings, SharedSettings};
 use text::shape_for_display;
 use translate::{TRANSLATE_MODEL_DEFAULT, TranslationSession};
 
@@ -96,6 +98,20 @@ fn main() -> Result<(), eframe::Error> {
         ui_locale.code()
     );
     let ui_locales = i18n::shared(ui_locale);
+    let settings_path = screen::default_path();
+    let settings = settings_path
+        .as_deref()
+        .and_then(screen::load)
+        .unwrap_or_default();
+    println!(
+        "🖥️ メイン画面追従: {}",
+        if settings.follow_main_screen {
+            "ON"
+        } else {
+            "OFF"
+        }
+    );
+    let shared_settings = screen::shared(settings);
 
     // 非同期処理（tokio）をマルチスレッドモードで起動
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -254,6 +270,8 @@ fn main() -> Result<(), eframe::Error> {
                 languages,
                 ui_locales.clone(),
                 locale_path.clone(),
+                shared_settings.clone(),
+                settings_path.clone(),
                 geom_path.clone(),
                 restored,
             ))
@@ -283,6 +301,12 @@ struct LumeSubApp {
     langs: SharedLanguageConfig,
     ui_locale: SharedUiLocale,
     locale_path: Option<std::path::PathBuf>,
+    settings: SharedSettings,
+    settings_path: Option<std::path::PathBuf>,
+    follow_diag: DiagLog,
+    overlay_fullscreen_fixed: bool,
+    fs_panel: Option<screen::FullscreenPanel>,
+    panel_diag: DiagLog,
     hover: hover::HoverState,
     geom: geometry::GeometrySaver,
     placed_initial: bool,
@@ -301,6 +325,8 @@ impl LumeSubApp {
         langs: SharedLanguageConfig,
         ui_locale: SharedUiLocale,
         locale_path: Option<std::path::PathBuf>,
+        settings: SharedSettings,
+        settings_path: Option<std::path::PathBuf>,
         geom_path: Option<std::path::PathBuf>,
         restored: bool,
     ) -> Self {
@@ -312,6 +338,12 @@ impl LumeSubApp {
             langs,
             ui_locale,
             locale_path,
+            settings,
+            settings_path,
+            follow_diag: DiagLog::new(),
+            overlay_fullscreen_fixed: false,
+            fs_panel: None,
+            panel_diag: DiagLog::new(),
             hover: hover::HoverState::new(),
             geom: geometry::GeometrySaver::new(geom_path),
             placed_initial: restored,
@@ -432,6 +464,17 @@ impl LumeSubApp {
             }
         });
         ui.separator();
+        // メイン画面追従のオン・オフ。変えたら即保存する
+        if let Ok(mut s) = self.settings.lock() {
+            let before = s.follow_main_screen;
+            ui.checkbox(&mut s.follow_main_screen, sh(t.follow_main_screen));
+            if s.follow_main_screen != before
+                && let Some(path) = &self.settings_path
+                && let Err(e) = screen::save(path, &s)
+            {
+                println!("⚠️ 設定の保存に失敗: {e}");
+            }
+        }
         // 保存した画面外位置などに迷子になった場合の救済
         if ui.button(sh(t.reset_position)).clicked()
             && let Some(monitor) = ui.ctx().input(|i| i.viewport().monitor_size)
@@ -474,6 +517,60 @@ impl eframe::App for LumeSubApp {
                 );
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 self.placed_initial = true;
+            }
+        }
+        // 字幕オーバーレイを常時最前面に。窓が出るまで毎フレーム試す
+        if !self.overlay_fullscreen_fixed {
+            if screen::ensure_overlay_over_fullscreen() {
+                self.overlay_fullscreen_fixed = true;
+                println!("🖥️ 字幕を常時最前面にしました（全Space＋レベル1000）");
+            } else {
+                self.follow_diag.log_if_changed(
+                    "overlay|missing",
+                    "🖥️ 最前面化: 字幕ウィンドウが見つかりません",
+                );
+            }
+        }
+        // フルスクリーン動画中はNSPanel字幕を出す（NSWindowは他アプリの
+        // フルスクリーンSpaceに入れない）。ログは別系列にして混線を防ぐ
+        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+            screen::sync_fullscreen_panel(
+                &mut self.fs_panel,
+                screen::overlay_occlusion_visible(),
+                outer,
+                screen::flip_height(),
+                &self.subtitle_text,
+                &mut self.panel_diag,
+            );
+        }
+        // メイン画面追従（字幕がメイン画面の外にあれば自動移動）
+        let follow = self
+            .settings
+            .lock()
+            .map(|s| s.follow_main_screen)
+            .unwrap_or(Settings::default().follow_main_screen);
+        if follow {
+            let outer = ctx.input(|i| i.viewport().outer_rect);
+            match (outer, screen::active_screen_snapshot()) {
+                (Some(outer), Ok(main)) => {
+                    if let Some(pos) = screen::reconcile_target(main, outer) {
+                        println!("🖥️ 追従: 移動します {outer:?} → {pos:?}（メイン画面 {main:?}）");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    } else {
+                        self.follow_diag.log_if_changed(
+                            &format!("stay|{main:?}"),
+                            &format!(
+                                "🖥️ 追従: 待機中（字幕 {outer:?} はメイン画面 {main:?} の内側）"
+                            ),
+                        );
+                    }
+                }
+                (outer, snap) => {
+                    self.follow_diag.log_if_changed(
+                        &format!("blocked|outer={}|snap={snap:?}", outer.is_some()),
+                        &format!("🖥️ 追従: 判定できません（字幕位置 {outer:?} / 画面 {snap:?}）"),
+                    );
+                }
             }
         }
         self.geom.tick(ctx);
