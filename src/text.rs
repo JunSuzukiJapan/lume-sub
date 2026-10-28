@@ -63,6 +63,67 @@ fn reorder_line(reshaped_line: &str) -> String {
     }
 }
 
+/// 論理順の1行を整形する（結合＋視覚順化）
+fn shape_logical_line(line: &str) -> String {
+    reorder_line(&reshaper().reshape(line))
+}
+
+/// 段落を表示幅に収まる行に割り、行ごとに視覚順化する。
+///
+/// 視覚順化した全文を egui に渡すと、egui の LTR 折返しで行順が逆になる
+/// （論理的先頭が最終行に落ちる）。論理順のまま単語単位で割り、
+/// 各行を独立に整形することで正しい行順を保つ。
+/// RTL 文字を含まない場合は入力をそのまま返す（egui の折返しに任せる）。
+/// `max_width` が正でない場合は折返さず全文を1行として整形する。
+pub fn shape_paragraph_for_display<'a>(
+    text: &'a str,
+    max_width: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> Cow<'a, str> {
+    if !needs_shaping(text) {
+        return Cow::Borrowed(text);
+    }
+    if max_width <= 0.0 {
+        return Cow::Owned(shape_for_display(text).into_owned());
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, para) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&wrap_paragraph(para, max_width, measure));
+    }
+    Cow::Owned(out)
+}
+
+/// 論理順の段落を貪欲に折り返し、各行を整形する。行順は論理順のまま。
+/// 1単語で幅を超える場合ははみ出しを許して1行にする
+fn wrap_paragraph(para: &str, max_width: f32, measure: &dyn Fn(&str) -> f32) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_shaped = String::new();
+    for w in para.split_whitespace() {
+        let cand = if current.is_empty() {
+            w.to_string()
+        } else {
+            format!("{current} {w}")
+        };
+        let shaped = shape_logical_line(&cand);
+        if current.is_empty() || measure(&shaped) <= max_width {
+            current = cand;
+            current_shaped = shaped;
+        } else {
+            lines.push(std::mem::take(&mut current_shaped));
+            current = w.to_string();
+            current_shaped = shape_logical_line(&current);
+        }
+    }
+    if !current_shaped.is_empty() {
+        lines.push(current_shaped);
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +176,46 @@ mod tests {
     #[test]
     fn multiline_shaped_per_line() {
         assert_eq!(shape_for_display("a\nب"), "a\n\u{FE8F}");
+    }
+
+    /// テスト用の幅（1文字10pt換算）
+    fn count10(s: &str) -> f32 {
+        s.chars().count() as f32 * 10.0
+    }
+
+    #[test]
+    fn ltr_paragraph_borrows_unchanged() {
+        assert!(matches!(
+            shape_paragraph_for_display("hello world foo bar", 5.0, &count10),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn short_rtl_stays_single_line() {
+        assert_eq!(
+            shape_paragraph_for_display("سلام", 1000.0, &count10),
+            shape_for_display("سلام")
+        );
+    }
+
+    #[test]
+    fn long_rtl_wraps_in_logical_order() {
+        // 2語ずつ収まる幅：行順が論理順のまま2行になる
+        let line1 = shape_for_display("السلام عليكم");
+        let width = count10(&line1) + 5.0;
+        let shaped = shape_paragraph_for_display("السلام عليكم ورحمة الله", width, &count10);
+        let expect = format!("{line1}\n{}", shape_for_display("ورحمة الله"));
+        assert_eq!(shaped, expect);
+    }
+
+    #[test]
+    fn explicit_breaks_and_zero_width() {
+        let s = shape_paragraph_for_display("سلام\nلا", 1000.0, &count10);
+        assert_eq!(s, format!("{}\n{}", shape_for_display("سلام"), shape_for_display("لا")));
+        assert_eq!(
+            shape_paragraph_for_display("سلام عليكم", 0.0, &count10),
+            shape_for_display("سلام عليكم")
+        );
     }
 }

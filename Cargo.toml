@@ -25,3 +25,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 unicode-bidi = "0.3.18"
 arabic_reshaper = "0.4.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"

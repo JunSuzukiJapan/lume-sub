@@ -2,6 +2,8 @@ mod asr;
 mod audio;
 mod control;
 mod fonts;
+mod geometry;
+mod hover;
 mod language;
 mod text;
 mod translate;
@@ -180,13 +182,27 @@ fn main() -> Result<(), eframe::Error> {
     controller.start();
 
     // GUI（egui）のウィンドウ設定：字幕オーバーレイ
+    let geom_path = geometry::default_path();
+    let saved = geom_path.as_deref().and_then(geometry::load);
+    if saved.is_some() {
+        println!("🪟 字幕位置を復元します");
+    }
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_transparent(true)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_mouse_passthrough(true)
+        .with_inner_size(
+            saved.map(|g| [g.w, g.h])
+                .unwrap_or([geometry::DEFAULT_W, geometry::DEFAULT_H]),
+        )
+        .with_min_inner_size([geometry::MIN_W, geometry::MIN_H]);
+    if let Some(g) = saved {
+        viewport = viewport.with_position([g.x, g.y]);
+    }
+    let restored = saved.is_some();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_transparent(true)
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_mouse_passthrough(true)
-            .with_inner_size([800.0, 150.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -212,6 +228,8 @@ fn main() -> Result<(), eframe::Error> {
                 initial_text,
                 controller,
                 languages,
+                geom_path.clone(),
+                restored,
             ))
         }),
     )
@@ -237,9 +255,15 @@ struct LumeSubApp {
     receiver: Arc<Mutex<mpsc::Receiver<AppEvent>>>,
     controller: PipelineController,
     langs: SharedLanguageConfig,
+    hover: hover::HoverState,
+    geom: geometry::GeometrySaver,
+    placed_initial: bool,
+    /// 整形済み字幕の覚え書き（論理文・幅・視覚文）。変化時のみ再計算する
+    shaped_cache: (String, u32, String),
 }
 
 impl LumeSubApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: egui::Context,
         mut rx: mpsc::Receiver<AppEvent>,
@@ -247,6 +271,8 @@ impl LumeSubApp {
         initial_text: String,
         controller: PipelineController,
         langs: SharedLanguageConfig,
+        geom_path: Option<std::path::PathBuf>,
+        restored: bool,
     ) -> Self {
         let (tx_internal, rx_internal) = mpsc::channel(100);
         let app = Self {
@@ -254,6 +280,10 @@ impl LumeSubApp {
             receiver: Arc::new(Mutex::new(rx_internal)),
             controller,
             langs,
+            hover: hover::HoverState::new(),
+            geom: geometry::GeometrySaver::new(geom_path),
+            placed_initial: restored,
+            shaped_cache: (String::new(), u32::MAX, String::new()),
         };
 
         let receiver_ctx = ctx.clone();
@@ -335,6 +365,22 @@ impl LumeSubApp {
                 );
             }
         });
+        ui.separator();
+        // 保存した画面外位置などに迷子になった場合の救済
+        if ui.button("字幕位置をリセット").clicked()
+            && let Some(monitor) = ui.ctx().input(|i| i.viewport().monitor_size)
+        {
+            let size = egui::vec2(geometry::DEFAULT_W, geometry::DEFAULT_H);
+            let pos = geometry::bottom_center(monitor, size, geometry::MARGIN_BOTTOM);
+            ui.ctx().send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::OuterPosition(pos),
+            );
+            ui.ctx().send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::InnerSize(size),
+            );
+        }
     }
 }
 
@@ -350,12 +396,54 @@ impl eframe::App for LumeSubApp {
             }
         }
 
+        let interactive = self.hover.poll(ctx);
+        // 初回（保存なし）はモニター情報が掴めた初フレームで中央下部へ
+        if !self.placed_initial {
+            let info = ctx.input(|i| (i.viewport().monitor_size, i.viewport().inner_rect));
+            if let (Some(monitor), Some(inner)) = info {
+                let pos = geometry::bottom_center(
+                    monitor,
+                    inner.size(),
+                    geometry::MARGIN_BOTTOM,
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.placed_initial = true;
+            }
+        }
+        self.geom.tick(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
+                // RTL は論理順のまま実フォント幅で割り、行ごとに整形する（行順保持）
+                let max_w = ui.available_width() - 4.0;
+                let width_key = (max_w * 2.0).round().max(0.0) as u32;
+                let visual = if self.shaped_cache.0 == self.subtitle_text
+                    && self.shaped_cache.1 == width_key
+                {
+                    self.shaped_cache.2.clone()
+                } else {
+                    let shaped = ui.fonts(|fonts| {
+                        let measure = |s: &str| {
+                            fonts
+                                .layout_no_wrap(
+                                    s.to_owned(),
+                                    egui::FontId::proportional(28.0),
+                                    egui::Color32::WHITE,
+                                )
+                                .size()
+                                .x
+                        };
+                        text::shape_paragraph_for_display(&self.subtitle_text, max_w, &measure)
+                            .into_owned()
+                    });
+                    self.shaped_cache =
+                        (self.subtitle_text.clone(), width_key, shaped.clone());
+                    shaped
+                };
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(shape_for_display(&self.subtitle_text).into_owned())
+                        egui::RichText::new(visual)
                             .font(egui::FontId::proportional(28.0))
                             .color(egui::Color32::WHITE)
                             .strong(),
@@ -363,7 +451,17 @@ impl eframe::App for LumeSubApp {
                     .wrap(true),
                 );
             });
+            if interactive {
+                hover::paint_frame(ui);
+            }
         });
+
+        // ホバー検出のため待機中も再描画する（操作中は毎フレーム）
+        if interactive {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // 操作ウィンドウは常時表示（閉じても次フレームで復活する）
         ctx.show_viewport_immediate(
