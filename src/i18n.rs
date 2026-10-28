@@ -1,80 +1,18 @@
 //! UI表示言語の多言語化
 //!
-//! 字幕パイプラインの入出力言語（[`language`](crate::language)）とは別に、
-//! 操作ウィンドウ・字幕メッセージなどのUI文言を切り替える。
-//! 全文言は [`UiStrings`] ひとつに集約し、[`UiLocale::strings`] で取得する。
+//! 字幕パイプライン対応の全言語（[`Language`]）で、操作ウィンドウ・
+//! 字幕メッセージなどのUI文言も表示できる。既定は英語。
+//! 全文言は [`UiStrings`] ひとつに集約し、[`Language::strings`] で取得する。
 //! 文言を足すときは全ロケールの定数と網羅テストに足すこと。
 //! 選択は `~/.config/lume-sub/ui_locale.json` に保存し、次回起動時に復元する。
 
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-/// UI表示言語
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UiLocale {
-    #[default]
-    Japanese,
-    English,
-}
+use crate::language::Language;
 
-impl UiLocale {
-    pub fn all() -> &'static [UiLocale] {
-        use UiLocale::*;
-        &[Japanese, English]
-    }
-
-    /// 短縮コード（設定ファイル・環境変数・ログ用）
-    pub fn code(self) -> &'static str {
-        match self {
-            UiLocale::Japanese => "ja",
-            UiLocale::English => "en",
-        }
-    }
-
-    /// 選択UIに並べる自称
-    pub fn display_name(self) -> &'static str {
-        match self {
-            UiLocale::Japanese => "日本語",
-            UiLocale::English => "English",
-        }
-    }
-
-    /// このロケールの文言表
-    pub fn strings(self) -> &'static UiStrings {
-        match self {
-            UiLocale::Japanese => &JA_STRINGS,
-            UiLocale::English => &EN_STRINGS,
-        }
-    }
-
-    /// `UI_LANG` 環境変数から読む。未設定なら None
-    pub fn from_env() -> Option<Self> {
-        let v = std::env::var("UI_LANG")
-            .ok()
-            .filter(|v| !v.is_empty())?;
-        match v.parse() {
-            Ok(l) => Some(l),
-            Err(e) => {
-                println!("⚠️ {e}（表示言語は日本語にします）");
-                Some(UiLocale::Japanese)
-            }
-        }
-    }
-}
-
-impl FromStr for UiLocale {
-    type Err = String;
-
-    /// コード・英語名・自称を受け付ける（大小無視）
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "ja" | "japanese" | "日本語" => Ok(UiLocale::Japanese),
-            "en" | "english" => Ok(UiLocale::English),
-            _ => Err(format!("unknown UI locale: {s}")),
-        }
-    }
-}
+/// UI表示言語。字幕対応言語と同一集合にするための別名。
+pub type UiLocale = Language;
 
 /// UI文言の一元管理型。`{}` を含む文は直接触らず、対応するメソッドで埋める
 /// （ロケールによって語順が違うため）。実体はロケール別の定数のみ。
@@ -110,17 +48,17 @@ impl UiStrings {
         template.replacen("{}", arg, 1)
     }
 
-    /// 状態行（例: `状態: ▶ 動作中`）
+    /// 状態行（例: `Status: ▶ Running`）
     pub fn status_line(&self, label: &str) -> String {
         Self::fill(self.tpl_status_line, label)
     }
 
-    /// 言語設定行（例: `設定: auto → 日本語`）
+    /// 言語設定行（例: `Settings: auto → 日本語`）
     pub fn settings_line(&self, describe: &str) -> String {
         Self::fill(self.tpl_settings_line, describe)
     }
 
-    /// ASR開始直後の字幕（例: `🎧 auto → 日本語 聞き取り中...`）
+    /// ASR開始直後の字幕（例: `🎧 Listening (auto → 日本語)...`）
     pub fn listening_text(&self, pair: &str) -> String {
         Self::fill(self.tpl_listening, pair)
     }
@@ -131,30 +69,82 @@ impl UiStrings {
     }
 }
 
-const JA_STRINGS: UiStrings = UiStrings {
-    display_language: "表示言語",
-    status_stopped: "⏹ 停止中",
-    status_running: "▶ 動作中",
-    status_paused: "⏸ 一時停止中",
-    input_language: "入力言語",
-    output_language: "出力言語",
-    auto_detect: "auto（自動検出）",
-    lang_read_failed: "言語設定の読み取りに失敗",
-    input_note: "※ 入力言語は次回接続から反映（停止→開始）",
-    start: "▶ 開始",
-    resume: "▶ 再開",
-    pause: "⏸ 一時停止",
-    stop: "⏹ 停止",
-    quit: "⏻ 終了",
-    reset_position: "字幕位置をリセット",
+const AR_STRINGS: UiStrings = UiStrings {
+    display_language: "لغة العرض",
+    status_stopped: "⏹ متوقف",
+    status_running: "▶ يعمل",
+    status_paused: "⏸ متوقف مؤقتًا",
+    input_language: "لغة الإدخال",
+    output_language: "لغة الإخراج",
+    auto_detect: "auto (كشف تلقائي)",
+    lang_read_failed: "تعذّر قراءة إعدادات اللغة",
+    input_note: "* تُطبَّق لغة الإدخال عند الاتصال التالي (إيقاف ثم بدء)",
+    start: "▶ بدء",
+    resume: "▶ استئناف",
+    pause: "⏸ إيقاف مؤقت",
+    stop: "⏹ إيقاف",
+    quit: "⏻ خروج",
+    reset_position: "إعادة ضبط موضع الترجمة",
     control_title: "LumeSub Control",
-    connecting: "ASRに接続中...",
-    play_prompt: "YouTubeなどを再生して音を鳴らしてください...",
-    drag_to_move: "ドラッグで移動",
-    tpl_status_line: "状態: {}",
-    tpl_settings_line: "設定: {}",
-    tpl_listening: "🎧 {} 聞き取り中...",
-    tpl_unsupported_audio: "⚠️ 音声フォーマット未対応: {}",
+    connecting: "جارٍ الاتصال بخدمة ASR...",
+    play_prompt: "شغّل شيئًا يحتوي على صوت (مثل YouTube)...",
+    drag_to_move: "اسحب للتحريك",
+    tpl_status_line: "الحالة: {}",
+    tpl_settings_line: "الإعدادات: {}",
+    tpl_listening: "🎧 جارٍ الاستماع ({})...",
+    tpl_unsupported_audio: "⚠️ تنسيق صوت غير مدعوم: {}",
+};
+
+const BN_STRINGS: UiStrings = UiStrings {
+    display_language: "প্রদর্শন ভাষা",
+    status_stopped: "⏹ বন্ধ",
+    status_running: "▶ চলছে",
+    status_paused: "⏸ বিরত",
+    input_language: "ইনপুট ভাষা",
+    output_language: "আউটপুট ভাষা",
+    auto_detect: "auto (স্বয়ংক্রিয় শনাক্তকরণ)",
+    lang_read_failed: "ভাষা সেটিং পড়তে ব্যর্থ",
+    input_note: "* ইনপুট ভাষা পরবর্তী সংযোগ থেকে প্রযোজ্য হবে (বন্ধ → শুরু)",
+    start: "▶ শুরু",
+    resume: "▶ পুনরায় শুরু",
+    pause: "⏸ বিরতি",
+    stop: "⏹ বন্ধ",
+    quit: "⏻ প্রস্থান",
+    reset_position: "সাবটাইটেল অবস্থান রিসেট",
+    control_title: "LumeSub Control",
+    connecting: "ASR-এ সংযোগ করা হচ্ছে...",
+    play_prompt: "অডিও আছে এমন কিছু চালান (যেমন YouTube)...",
+    drag_to_move: "সরাতে টেনে আনুন",
+    tpl_status_line: "অবস্থা: {}",
+    tpl_settings_line: "সেটিং: {}",
+    tpl_listening: "🎧 শোনা হচ্ছে ({})...",
+    tpl_unsupported_audio: "⚠️ অসমর্থিত অডিও ফরম্যাট: {}",
+};
+
+const NL_STRINGS: UiStrings = UiStrings {
+    display_language: "Weergavetaal",
+    status_stopped: "⏹ Gestopt",
+    status_running: "▶ Actief",
+    status_paused: "⏸ Gepauzeerd",
+    input_language: "Invoertaal",
+    output_language: "Uitvoertaal",
+    auto_detect: "auto (automatisch detecteren)",
+    lang_read_failed: "Taalinstellingen konden niet worden gelezen",
+    input_note: "* Invoertaal geldt vanaf de volgende verbinding (Stop → Start)",
+    start: "▶ Start",
+    resume: "▶ Hervat",
+    pause: "⏸ Pauze",
+    stop: "⏹ Stop",
+    quit: "⏻ Afsluiten",
+    reset_position: "Ondertitelpositie resetten",
+    control_title: "LumeSub Control",
+    connecting: "Verbinden met ASR...",
+    play_prompt: "Speel iets met audio af (bijv. YouTube)...",
+    drag_to_move: "slepen om te verplaatsen",
+    tpl_status_line: "Status: {}",
+    tpl_settings_line: "Instellingen: {}",
+    tpl_listening: "🎧 Luisteren ({})...",
+    tpl_unsupported_audio: "⚠️ Niet-ondersteunde audio-indeling: {}",
 };
 
 const EN_STRINGS: UiStrings = UiStrings {
@@ -182,6 +172,600 @@ const EN_STRINGS: UiStrings = UiStrings {
     tpl_listening: "🎧 Listening ({})...",
     tpl_unsupported_audio: "⚠️ Unsupported audio format: {}",
 };
+
+const FR_STRINGS: UiStrings = UiStrings {
+    display_language: "Langue d'affichage",
+    status_stopped: "⏹ Arrêté",
+    status_running: "▶ En cours",
+    status_paused: "⏸ En pause",
+    input_language: "Langue d'entrée",
+    output_language: "Langue de sortie",
+    auto_detect: "auto (détection automatique)",
+    lang_read_failed: "Échec de lecture des paramètres de langue",
+    input_note: "* La langue d'entrée s'applique à la prochaine connexion (Stop → Start)",
+    start: "▶ Démarrer",
+    resume: "▶ Reprendre",
+    pause: "⏸ Pause",
+    stop: "⏹ Arrêter",
+    quit: "⏻ Quitter",
+    reset_position: "Réinitialiser la position des sous-titres",
+    control_title: "LumeSub Control",
+    connecting: "Connexion à l'ASR...",
+    play_prompt: "Lisez un contenu avec audio (p. ex. YouTube)...",
+    drag_to_move: "glisser pour déplacer",
+    tpl_status_line: "Statut : {}",
+    tpl_settings_line: "Paramètres : {}",
+    tpl_listening: "🎧 Écoute ({})...",
+    tpl_unsupported_audio: "⚠️ Format audio non pris en charge : {}",
+};
+
+const DE_STRINGS: UiStrings = UiStrings {
+    display_language: "Anzeigesprache",
+    status_stopped: "⏹ Gestoppt",
+    status_running: "▶ Läuft",
+    status_paused: "⏸ Pausiert",
+    input_language: "Eingabesprache",
+    output_language: "Ausgabesprache",
+    auto_detect: "auto (automatische Erkennung)",
+    lang_read_failed: "Spracheinstellungen konnten nicht gelesen werden",
+    input_note: "* Eingabesprache gilt ab der nächsten Verbindung (Stopp → Start)",
+    start: "▶ Start",
+    resume: "▶ Fortsetzen",
+    pause: "⏸ Pause",
+    stop: "⏹ Stopp",
+    quit: "⏻ Beenden",
+    reset_position: "Untertitelposition zurücksetzen",
+    control_title: "LumeSub Control",
+    connecting: "Verbinde mit ASR...",
+    play_prompt: "Etwas mit Ton abspielen (z. B. YouTube)...",
+    drag_to_move: "zum Verschieben ziehen",
+    tpl_status_line: "Status: {}",
+    tpl_settings_line: "Einstellungen: {}",
+    tpl_listening: "🎧 Höre zu ({})...",
+    tpl_unsupported_audio: "⚠️ Nicht unterstütztes Audioformat: {}",
+};
+
+const HE_STRINGS: UiStrings = UiStrings {
+    display_language: "שפת תצוגה",
+    status_stopped: "⏹ מופסק",
+    status_running: "▶ פועל",
+    status_paused: "⏸ מושהה",
+    input_language: "שפת קלט",
+    output_language: "שפת פלט",
+    auto_detect: "auto (זיהוי אוטומטי)",
+    lang_read_failed: "נכשל בקריאת הגדרות השפה",
+    input_note: "* שפת הקלט תחול מהחיבור הבא (עצירה ואז התחלה)",
+    start: "▶ התחל",
+    resume: "▶ המשך",
+    pause: "⏸ השהה",
+    stop: "⏹ עצור",
+    quit: "⏻ צא",
+    reset_position: "איפוס מיקום הכתוביות",
+    control_title: "LumeSub Control",
+    connecting: "מתחבר ל-ASR...",
+    play_prompt: "הפעל תוכן עם שמע (למשל YouTube)...",
+    drag_to_move: "גרור להזזה",
+    tpl_status_line: "סטטוס: {}",
+    tpl_settings_line: "הגדרות: {}",
+    tpl_listening: "🎧 מקשיב ({})...",
+    tpl_unsupported_audio: "⚠️ פורמט שמע לא נתמך: {}",
+};
+
+const HI_STRINGS: UiStrings = UiStrings {
+    display_language: "प्रदर्शन भाषा",
+    status_stopped: "⏹ रुका हुआ",
+    status_running: "▶ चल रहा",
+    status_paused: "⏸ विरामित",
+    input_language: "इनपुट भाषा",
+    output_language: "आउटपुट भाषा",
+    auto_detect: "auto (स्वचालित पहचान)",
+    lang_read_failed: "भाषा सेटिंग पढ़ने में विफल",
+    input_note: "* इनपुट भाषा अगले कनेक्शन से लागू होगी (रोकें → शुरू करें)",
+    start: "▶ शुरू करें",
+    resume: "▶ फिर से शुरू करें",
+    pause: "⏸ विराम",
+    stop: "⏹ रोकें",
+    quit: "⏻ बाहर निकलें",
+    reset_position: "सबटाइटल स्थिति रीसेट करें",
+    control_title: "LumeSub Control",
+    connecting: "ASR से कनेक्ट हो रहा है...",
+    play_prompt: "ऑडियो वाली कोई चीज़ चलाएँ (जैसे YouTube)...",
+    drag_to_move: "ले जाने के लिए खींचें",
+    tpl_status_line: "स्थिति: {}",
+    tpl_settings_line: "सेटिंग: {}",
+    tpl_listening: "🎧 सुन रहे हैं ({})...",
+    tpl_unsupported_audio: "⚠️ असमर्थित ऑडियो प्रारूप: {}",
+};
+
+const ID_STRINGS: UiStrings = UiStrings {
+    display_language: "Bahasa tampilan",
+    status_stopped: "⏹ Berhenti",
+    status_running: "▶ Berjalan",
+    status_paused: "⏸ Dijeda",
+    input_language: "Bahasa masukan",
+    output_language: "Bahasa keluaran",
+    auto_detect: "auto (deteksi otomatis)",
+    lang_read_failed: "Gagal membaca pengaturan bahasa",
+    input_note: "* Bahasa masukan berlaku mulai koneksi berikutnya (Stop → Start)",
+    start: "▶ Mulai",
+    resume: "▶ Lanjutkan",
+    pause: "⏸ Jeda",
+    stop: "⏹ Berhenti",
+    quit: "⏻ Keluar",
+    reset_position: "Atur ulang posisi subtitle",
+    control_title: "LumeSub Control",
+    connecting: "Menghubungkan ke ASR...",
+    play_prompt: "Putar sesuatu dengan audio (mis. YouTube)...",
+    drag_to_move: "seret untuk memindahkan",
+    tpl_status_line: "Status: {}",
+    tpl_settings_line: "Pengaturan: {}",
+    tpl_listening: "🎧 Mendengarkan ({})...",
+    tpl_unsupported_audio: "⚠️ Format audio tidak didukung: {}",
+};
+
+const IT_STRINGS: UiStrings = UiStrings {
+    display_language: "Lingua di visualizzazione",
+    status_stopped: "⏹ Arrestato",
+    status_running: "▶ In esecuzione",
+    status_paused: "⏸ In pausa",
+    input_language: "Lingua di input",
+    output_language: "Lingua di output",
+    auto_detect: "auto (rilevamento automatico)",
+    lang_read_failed: "Lettura delle impostazioni lingua non riuscita",
+    input_note: "* La lingua di input si applica dalla prossima connessione (Stop → Start)",
+    start: "▶ Avvia",
+    resume: "▶ Riprendi",
+    pause: "⏸ Pausa",
+    stop: "⏹ Ferma",
+    quit: "⏻ Esci",
+    reset_position: "Reimposta posizione sottotitoli",
+    control_title: "LumeSub Control",
+    connecting: "Connessione ad ASR...",
+    play_prompt: "Riproduci qualcosa con audio (es. YouTube)...",
+    drag_to_move: "trascina per spostare",
+    tpl_status_line: "Stato: {}",
+    tpl_settings_line: "Impostazioni: {}",
+    tpl_listening: "🎧 In ascolto ({})...",
+    tpl_unsupported_audio: "⚠️ Formato audio non supportato: {}",
+};
+
+const JA_STRINGS: UiStrings = UiStrings {
+    display_language: "表示言語",
+    status_stopped: "⏹ 停止中",
+    status_running: "▶ 動作中",
+    status_paused: "⏸ 一時停止中",
+    input_language: "入力言語",
+    output_language: "出力言語",
+    auto_detect: "auto（自動検出）",
+    lang_read_failed: "言語設定の読み取りに失敗",
+    input_note: "※ 入力言語は次回接続から反映（停止→開始）",
+    start: "▶ 開始",
+    resume: "▶ 再開",
+    pause: "⏸ 一時停止",
+    stop: "⏹ 停止",
+    quit: "⏻ 終了",
+    reset_position: "字幕位置をリセット",
+    control_title: "LumeSub Control",
+    connecting: "ASRに接続中...",
+    play_prompt: "YouTubeなどを再生して音を鳴らしてください...",
+    drag_to_move: "ドラッグで移動",
+    tpl_status_line: "状態: {}",
+    tpl_settings_line: "設定: {}",
+    tpl_listening: "🎧 {} 聞き取り中...",
+    tpl_unsupported_audio: "⚠️ 音声フォーマット未対応: {}",
+};
+
+const KN_STRINGS: UiStrings = UiStrings {
+    display_language: "ಪ್ರದರ್ಶನ ಭಾಷೆ",
+    status_stopped: "⏹ ನಿಲ್ಲಿಸಲಾಗಿದೆ",
+    status_running: "▶ ಚಾಲ್ತಿಯಲ್ಲಿದೆ",
+    status_paused: "⏸ ವಿರಾಮಗೊಳಿಸಲಾಗಿದೆ",
+    input_language: "ಇನ್‌ಪುಟ್ ಭಾಷೆ",
+    output_language: "ಔಟ್‌ಪುಟ್ ಭಾಷೆ",
+    auto_detect: "auto (ಸ್ವಯಂಚಾಲಿತ ಪತ್ತೆ)",
+    lang_read_failed: "ಭಾಷಾ ಸೆಟ್ಟಿಂಗ್‌ಗಳನ್ನು ಓದಲು ವಿಫಲವಾಗಿದೆ",
+    input_note: "* ಇನ್‌ಪುಟ್ ಭಾಷೆಯು ಮುಂದಿನ ಸಂಪರ್ಕದಿಂದ ಅನ್ವಯವಾಗುತ್ತದೆ (ನಿಲ್ಲಿಸಿ → ಪ್ರಾರಂಭಿಸಿ)",
+    start: "▶ ಪ್ರಾರಂಭಿಸಿ",
+    resume: "▶ ಮುಂದುವರಿಸಿ",
+    pause: "⏸ ವಿರಾಮ",
+    stop: "⏹ ನಿಲ್ಲಿಸಿ",
+    quit: "⏻ ನಿರ್ಗಮಿಸಿ",
+    reset_position: "ಉಪಶೀರ್ಷಿಕೆ ಸ್ಥಾನವನ್ನು ಮರುಹೊಂದಿಸಿ",
+    control_title: "LumeSub Control",
+    connecting: "ASR ಗೆ ಸಂಪರ್ಕಿಸಲಾಗುತ್ತಿದೆ...",
+    play_prompt: "ಆಡಿಯೋ ಇರುವ ಏನನ್ನಾದರೂ ಪ್ಲೇ ಮಾಡಿ (ಉದಾ. YouTube)...",
+    drag_to_move: "ಸರಿಸಲು ಎಳೆಯಿರಿ",
+    tpl_status_line: "ಸ್ಥಿತಿ: {}",
+    tpl_settings_line: "ಸೆಟ್ಟಿಂಗ್‌ಗಳು: {}",
+    tpl_listening: "🎧 ಆಲಿಸಲಾಗುತ್ತಿದೆ ({})...",
+    tpl_unsupported_audio: "⚠️ ಬೆಂಬಲಿಸದ ಆಡಿಯೋ ಸ್ವರೂಪ: {}",
+};
+
+const KO_STRINGS: UiStrings = UiStrings {
+    display_language: "표시 언어",
+    status_stopped: "⏹ 중지됨",
+    status_running: "▶ 실행 중",
+    status_paused: "⏸ 일시 정지됨",
+    input_language: "입력 언어",
+    output_language: "출력 언어",
+    auto_detect: "auto (자동 감지)",
+    lang_read_failed: "언어 설정을 읽지 못했습니다",
+    input_note: "* 입력 언어는 다음 연결부터 적용됩니다(중지 → 시작)",
+    start: "▶ 시작",
+    resume: "▶ 다시 시작",
+    pause: "⏸ 일시 정지",
+    stop: "⏹ 중지",
+    quit: "⏻ 종료",
+    reset_position: "자막 위치 초기화",
+    control_title: "LumeSub Control",
+    connecting: "ASR에 연결 중...",
+    play_prompt: "오디오가 있는 콘텐츠를 재생하세요(예: YouTube)...",
+    drag_to_move: "드래그하여 이동",
+    tpl_status_line: "상태: {}",
+    tpl_settings_line: "설정: {}",
+    tpl_listening: "🎧 수신 중({})...",
+    tpl_unsupported_audio: "⚠️ 지원되지 않는 오디오 형식: {}",
+};
+
+const MS_STRINGS: UiStrings = UiStrings {
+    display_language: "Bahasa paparan",
+    status_stopped: "⏹ Berhenti",
+    status_running: "▶ Berjalan",
+    status_paused: "⏸ Dijeda",
+    input_language: "Bahasa input",
+    output_language: "Bahasa output",
+    auto_detect: "auto (pengesanan automatik)",
+    lang_read_failed: "Gagal membaca tetapan bahasa",
+    input_note: "* Bahasa input berkuat kuasa mulai sambungan seterusnya (Stop → Start)",
+    start: "▶ Mula",
+    resume: "▶ Sambung",
+    pause: "⏸ Jeda",
+    stop: "⏹ Henti",
+    quit: "⏻ Keluar",
+    reset_position: "Tetap semula kedudukan sari kata",
+    control_title: "LumeSub Control",
+    connecting: "Menyambung ke ASR...",
+    play_prompt: "Mainkan sesuatu dengan audio (cth. YouTube)...",
+    drag_to_move: "seret untuk mengalih",
+    tpl_status_line: "Status: {}",
+    tpl_settings_line: "Tetapan: {}",
+    tpl_listening: "🎧 Mendengar ({})...",
+    tpl_unsupported_audio: "⚠️ Format audio tidak disokong: {}",
+};
+
+const ZH_STRINGS: UiStrings = UiStrings {
+    display_language: "显示语言",
+    status_stopped: "⏹ 已停止",
+    status_running: "▶ 运行中",
+    status_paused: "⏸ 已暂停",
+    input_language: "输入语言",
+    output_language: "输出语言",
+    auto_detect: "auto（自动检测）",
+    lang_read_failed: "读取语言设置失败",
+    input_note: "* 输入语言将在下次连接时生效（停止→开始）",
+    start: "▶ 开始",
+    resume: "▶ 继续",
+    pause: "⏸ 暂停",
+    stop: "⏹ 停止",
+    quit: "⏻ 退出",
+    reset_position: "重置字幕位置",
+    control_title: "LumeSub Control",
+    connecting: "正在连接 ASR...",
+    play_prompt: "请播放带音频的内容（例如 YouTube）...",
+    drag_to_move: "拖动以移动",
+    tpl_status_line: "状态：{}",
+    tpl_settings_line: "设置：{}",
+    tpl_listening: "🎧 正在收听（{}）...",
+    tpl_unsupported_audio: "⚠️ 不支持的音频格式：{}",
+};
+
+const MR_STRINGS: UiStrings = UiStrings {
+    display_language: "प्रदर्शन भाषा",
+    status_stopped: "⏹ थांबवले",
+    status_running: "▶ सुरू आहे",
+    status_paused: "⏸ विराम दिला",
+    input_language: "इनपुट भाषा",
+    output_language: "आउटपुट भाषा",
+    auto_detect: "auto (स्वयंचलित ओळख)",
+    lang_read_failed: "भाषा सेटिंग्ज वाचण्यात अयशस्वी",
+    input_note: "* इनपुट भाषा पुढील कनेक्शनपासून लागू होईल (थांबवा → सुरू करा)",
+    start: "▶ सुरू करा",
+    resume: "▶ पुन्हा सुरू करा",
+    pause: "⏸ विराम",
+    stop: "⏹ थांबवा",
+    quit: "⏻ बाहेर पडा",
+    reset_position: "उपशीर्षक स्थान रीसेट करा",
+    control_title: "LumeSub Control",
+    connecting: "ASR शी कनेक्ट होत आहे...",
+    play_prompt: "ऑडिओ असलेले काहीतरी प्ले करा (उदा. YouTube)...",
+    drag_to_move: "हलवण्यासाठी ओढा",
+    tpl_status_line: "स्थिती: {}",
+    tpl_settings_line: "सेटिंग्ज: {}",
+    tpl_listening: "🎧 ऐकत आहे ({})...",
+    tpl_unsupported_audio: "⚠️ असमर्थित ऑडिओ स्वरूप: {}",
+};
+
+const PL_STRINGS: UiStrings = UiStrings {
+    display_language: "Język wyświetlania",
+    status_stopped: "⏹ Zatrzymano",
+    status_running: "▶ Działa",
+    status_paused: "⏸ Wstrzymano",
+    input_language: "Język wejściowy",
+    output_language: "Język wyjściowy",
+    auto_detect: "auto (wykrywanie automatyczne)",
+    lang_read_failed: "Nie udało się odczytać ustawień języka",
+    input_note: "* Język wejściowy zacznie obowiązywać od następnego połączenia (Stop → Start)",
+    start: "▶ Start",
+    resume: "▶ Wznów",
+    pause: "⏸ Wstrzymaj",
+    stop: "⏹ Stop",
+    quit: "⏻ Zamknij",
+    reset_position: "Resetuj pozycję napisów",
+    control_title: "LumeSub Control",
+    connecting: "Łączenie z ASR...",
+    play_prompt: "Odtwórz coś z dźwiękiem (np. YouTube)...",
+    drag_to_move: "przeciągnij, aby przenieść",
+    tpl_status_line: "Stan: {}",
+    tpl_settings_line: "Ustawienia: {}",
+    tpl_listening: "🎧 Słuchanie ({})...",
+    tpl_unsupported_audio: "⚠️ Nieobsługiwany format audio: {}",
+};
+
+const PT_STRINGS: UiStrings = UiStrings {
+    display_language: "Idioma de exibição",
+    status_stopped: "⏹ Parado",
+    status_running: "▶ Em execução",
+    status_paused: "⏸ Pausado",
+    input_language: "Idioma de entrada",
+    output_language: "Idioma de saída",
+    auto_detect: "auto (detecção automática)",
+    lang_read_failed: "Falha ao ler as configurações de idioma",
+    input_note: "* O idioma de entrada vale a partir da próxima conexão (Parar → Iniciar)",
+    start: "▶ Iniciar",
+    resume: "▶ Retomar",
+    pause: "⏸ Pausar",
+    stop: "⏹ Parar",
+    quit: "⏻ Sair",
+    reset_position: "Redefinir posição das legendas",
+    control_title: "LumeSub Control",
+    connecting: "Conectando ao ASR...",
+    play_prompt: "Reproduza algo com áudio (ex.: YouTube)...",
+    drag_to_move: "arraste para mover",
+    tpl_status_line: "Status: {}",
+    tpl_settings_line: "Configurações: {}",
+    tpl_listening: "🎧 Ouvindo ({})...",
+    tpl_unsupported_audio: "⚠️ Formato de áudio não suportado: {}",
+};
+
+const ES_STRINGS: UiStrings = UiStrings {
+    display_language: "Idioma de visualización",
+    status_stopped: "⏹ Detenido",
+    status_running: "▶ En ejecución",
+    status_paused: "⏸ En pausa",
+    input_language: "Idioma de entrada",
+    output_language: "Idioma de salida",
+    auto_detect: "auto (detección automática)",
+    lang_read_failed: "No se pudo leer la configuración de idioma",
+    input_note: "* El idioma de entrada se aplica desde la próxima conexión (Detener → Iniciar)",
+    start: "▶ Iniciar",
+    resume: "▶ Reanudar",
+    pause: "⏸ Pausar",
+    stop: "⏹ Detener",
+    quit: "⏻ Salir",
+    reset_position: "Restablecer posición de subtítulos",
+    control_title: "LumeSub Control",
+    connecting: "Conectando con ASR...",
+    play_prompt: "Reproduce algo con audio (p. ej., YouTube)...",
+    drag_to_move: "arrastra para mover",
+    tpl_status_line: "Estado: {}",
+    tpl_settings_line: "Ajustes: {}",
+    tpl_listening: "🎧 Escuchando ({})...",
+    tpl_unsupported_audio: "⚠️ Formato de audio no compatible: {}",
+};
+
+const TL_STRINGS: UiStrings = UiStrings {
+    display_language: "Wika ng display",
+    status_stopped: "⏹ Nakahinto",
+    status_running: "▶ Tumatakbo",
+    status_paused: "⏸ Naka-pause",
+    input_language: "Wika ng input",
+    output_language: "Wika ng output",
+    auto_detect: "auto (awtomatikong pagtuklas)",
+    lang_read_failed: "Nabigong basahin ang mga setting ng wika",
+    input_note: "* Ang wika ng input ay gagana mula sa susunod na koneksyon (Stop → Start)",
+    start: "▶ Simulan",
+    resume: "▶ Ipagpatuloy",
+    pause: "⏸ I-pause",
+    stop: "⏹ Ihinto",
+    quit: "⏻ Lumabas",
+    reset_position: "I-reset ang posisyon ng subtitle",
+    control_title: "LumeSub Control",
+    connecting: "Kumokonekta sa ASR...",
+    play_prompt: "Mag-play ng bagay na may audio (hal. YouTube)...",
+    drag_to_move: "i-drag upang ilipat",
+    tpl_status_line: "Katayuan: {}",
+    tpl_settings_line: "Mga setting: {}",
+    tpl_listening: "🎧 Nakikinig ({})...",
+    tpl_unsupported_audio: "⚠️ Hindi suportadong format ng audio: {}",
+};
+
+const TA_STRINGS: UiStrings = UiStrings {
+    display_language: "காட்சி மொழி",
+    status_stopped: "⏹ நிறுத்தப்பட்டது",
+    status_running: "▶ இயங்குகிறது",
+    status_paused: "⏸ இடைநிறுத்தப்பட்டது",
+    input_language: "உள்ளீட்டு மொழி",
+    output_language: "வெளியீட்டு மொழி",
+    auto_detect: "auto (தானியங்கு கண்டறிதல்)",
+    lang_read_failed: "மொழி அமைப்புகளைப் படிக்க முடியவில்லை",
+    input_note: "* உள்ளீட்டு மொழி அடுத்த இணைப்பிலிருந்து பொருந்தும் (நிறுத்து → தொடங்கு)",
+    start: "▶ தொடங்கு",
+    resume: "▶ தொடர்",
+    pause: "⏸ இடைநிறுத்து",
+    stop: "⏹ நிறுத்து",
+    quit: "⏻ வெளியேறு",
+    reset_position: "வசன நிலையை மீட்டமை",
+    control_title: "LumeSub Control",
+    connecting: "ASR உடன் இணைக்கிறது...",
+    play_prompt: "ஒலியுள்ள ஏதாவது இயக்குங்கள் (எ.கா. YouTube)...",
+    drag_to_move: "நகர்த்த இழுக்கவும்",
+    tpl_status_line: "நிலை: {}",
+    tpl_settings_line: "அமைப்புகள்: {}",
+    tpl_listening: "🎧 கேட்கிறது ({})...",
+    tpl_unsupported_audio: "⚠️ ஆதரிக்கப்படாத ஒலி வடிவம்: {}",
+};
+
+const TE_STRINGS: UiStrings = UiStrings {
+    display_language: "ప్రదర్శన భాష",
+    status_stopped: "⏹ ఆపివేయబడింది",
+    status_running: "▶ నడుస్తోంది",
+    status_paused: "⏸ విరామంలో ఉంది",
+    input_language: "ఇన్‌పుట్ భాష",
+    output_language: "అవుట్‌పుట్ భాష",
+    auto_detect: "auto (స్వయంచాలక గుర్తింపు)",
+    lang_read_failed: "భాషా సెట్టింగ్‌లను చదవడం విఫలమైంది",
+    input_note: "* ఇన్‌పుట్ భాష తదుపరి కనెక్షన్ నుండి వర్తిస్తుంది (ఆపు → ప్రారంభించు)",
+    start: "▶ ప్రారంభించు",
+    resume: "▶ కొనసాగించు",
+    pause: "⏸ విరామం",
+    stop: "⏹ ఆపు",
+    quit: "⏻ నిష్క్రమించు",
+    reset_position: "ఉపశీర్షిక స్థానాన్ని రీసెట్ చేయి",
+    control_title: "LumeSub Control",
+    connecting: "ASR కు కనెక్ట్ అవుతోంది...",
+    play_prompt: "ఆడియో ఉన్నదేదైనా ప్లే చేయండి (ఉదా. YouTube)...",
+    drag_to_move: "తరలించడానికి లాగండి",
+    tpl_status_line: "స్థితి: {}",
+    tpl_settings_line: "సెట్టింగ్‌లు: {}",
+    tpl_listening: "🎧 వింటోంది ({})...",
+    tpl_unsupported_audio: "⚠️ మద్దతు లేని ఆడియో ఆకృతి: {}",
+};
+
+const TH_STRINGS: UiStrings = UiStrings {
+    display_language: "ภาษาที่แสดง",
+    status_stopped: "⏹ หยุดแล้ว",
+    status_running: "▶ กำลังทำงาน",
+    status_paused: "⏸ หยุดชั่วคราว",
+    input_language: "ภาษาขาเข้า",
+    output_language: "ภาษาขาออก",
+    auto_detect: "auto (ตรวจจับอัตโนมัติ)",
+    lang_read_failed: "อ่านการตั้งค่าภาษาไม่สำเร็จ",
+    input_note: "* ภาษาขาเข้าจะมีผลตั้งแต่การเชื่อมต่อครั้งถัดไป (หยุด → เริ่ม)",
+    start: "▶ เริ่ม",
+    resume: "▶ ทำต่อ",
+    pause: "⏸ หยุดชั่วคราว",
+    stop: "⏹ หยุด",
+    quit: "⏻ ออก",
+    reset_position: "รีเซ็ตตำแหน่งคำบรรยาย",
+    control_title: "LumeSub Control",
+    connecting: "กำลังเชื่อมต่อกับ ASR...",
+    play_prompt: "เล่นสิ่งที่มีเสียง (เช่น YouTube)...",
+    drag_to_move: "ลากเพื่อย้าย",
+    tpl_status_line: "สถานะ: {}",
+    tpl_settings_line: "การตั้งค่า: {}",
+    tpl_listening: "🎧 กำลังฟัง ({})...",
+    tpl_unsupported_audio: "⚠️ ไม่รองรับรูปแบบเสียง: {}",
+};
+
+const TR_STRINGS: UiStrings = UiStrings {
+    display_language: "Görüntüleme dili",
+    status_stopped: "⏹ Durduruldu",
+    status_running: "▶ Çalışıyor",
+    status_paused: "⏸ Duraklatıldı",
+    input_language: "Giriş dili",
+    output_language: "Çıkış dili",
+    auto_detect: "auto (otomatik algılama)",
+    lang_read_failed: "Dil ayarları okunamadı",
+    input_note: "* Giriş dili sonraki bağlantıdan itibaren geçerlidir (Durdur → Başlat)",
+    start: "▶ Başlat",
+    resume: "▶ Sürdür",
+    pause: "⏸ Duraklat",
+    stop: "⏹ Durdur",
+    quit: "⏻ Çık",
+    reset_position: "Altyazı konumunu sıfırla",
+    control_title: "LumeSub Control",
+    connecting: "ASR'ye bağlanılıyor...",
+    play_prompt: "Sesli bir şey oynatın (örn. YouTube)...",
+    drag_to_move: "taşımak için sürükleyin",
+    tpl_status_line: "Durum: {}",
+    tpl_settings_line: "Ayarlar: {}",
+    tpl_listening: "🎧 Dinleniyor ({})...",
+    tpl_unsupported_audio: "⚠️ Desteklenmeyen ses biçimi: {}",
+};
+
+const VI_STRINGS: UiStrings = UiStrings {
+    display_language: "Ngôn ngữ hiển thị",
+    status_stopped: "⏹ Đã dừng",
+    status_running: "▶ Đang chạy",
+    status_paused: "⏸ Đã tạm dừng",
+    input_language: "Ngôn ngữ đầu vào",
+    output_language: "Ngôn ngữ đầu ra",
+    auto_detect: "auto (tự động phát hiện)",
+    lang_read_failed: "Không đọc được cài đặt ngôn ngữ",
+    input_note: "* Ngôn ngữ đầu vào có hiệu lực từ lần kết nối tiếp theo (Dừng → Bắt đầu)",
+    start: "▶ Bắt đầu",
+    resume: "▶ Tiếp tục",
+    pause: "⏸ Tạm dừng",
+    stop: "⏹ Dừng",
+    quit: "⏻ Thoát",
+    reset_position: "Đặt lại vị trí phụ đề",
+    control_title: "LumeSub Control",
+    connecting: "Đang kết nối tới ASR...",
+    play_prompt: "Phát nội dung có âm thanh (ví dụ: YouTube)...",
+    drag_to_move: "kéo để di chuyển",
+    tpl_status_line: "Trạng thái: {}",
+    tpl_settings_line: "Cài đặt: {}",
+    tpl_listening: "🎧 Đang nghe ({})...",
+    tpl_unsupported_audio: "⚠️ Định dạng âm thanh không được hỗ trợ: {}",
+};
+
+impl Language {
+    /// このロケールの文言表
+    pub fn strings(self) -> &'static UiStrings {
+        use Language::*;
+        match self {
+            Arabic => &AR_STRINGS,
+            Bengali => &BN_STRINGS,
+            Dutch => &NL_STRINGS,
+            English => &EN_STRINGS,
+            French => &FR_STRINGS,
+            German => &DE_STRINGS,
+            Hebrew => &HE_STRINGS,
+            Hindi => &HI_STRINGS,
+            Indonesian => &ID_STRINGS,
+            Italian => &IT_STRINGS,
+            Japanese => &JA_STRINGS,
+            Kannada => &KN_STRINGS,
+            Korean => &KO_STRINGS,
+            Malay => &MS_STRINGS,
+            Mandarin => &ZH_STRINGS,
+            Marathi => &MR_STRINGS,
+            Polish => &PL_STRINGS,
+            Portuguese => &PT_STRINGS,
+            Spanish => &ES_STRINGS,
+            Tagalog => &TL_STRINGS,
+            Tamil => &TA_STRINGS,
+            Telugu => &TE_STRINGS,
+            Thai => &TH_STRINGS,
+            Turkish => &TR_STRINGS,
+            Vietnamese => &VI_STRINGS,
+        }
+    }
+
+    /// `UI_LANG` 環境変数から読む。未設定なら None
+    pub fn from_env() -> Option<Self> {
+        let v = std::env::var("UI_LANG")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        match v.parse() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                println!("⚠️ {e}（表示言語は英語にします）");
+                Some(Language::English)
+            }
+        }
+    }
+}
 
 /// 保存先。`~/.config/lume-sub/ui_locale.json`（`XDG_CONFIG_HOME` 尊重）
 pub fn default_path() -> Option<PathBuf> {
@@ -238,20 +822,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_codes_names_and_display() {
-        assert_eq!("ja".parse::<UiLocale>().unwrap(), UiLocale::Japanese);
-        assert_eq!("JA".parse::<UiLocale>().unwrap(), UiLocale::Japanese);
-        assert_eq!("Japanese".parse::<UiLocale>().unwrap(), UiLocale::Japanese);
-        assert_eq!("日本語".parse::<UiLocale>().unwrap(), UiLocale::Japanese);
-        assert_eq!("en".parse::<UiLocale>().unwrap(), UiLocale::English);
-        assert_eq!("EN".parse::<UiLocale>().unwrap(), UiLocale::English);
-        assert_eq!("English".parse::<UiLocale>().unwrap(), UiLocale::English);
-        assert!("xx".parse::<UiLocale>().is_err());
+    fn default_is_english() {
+        assert_eq!(UiLocale::default(), Language::English);
     }
 
     #[test]
-    fn default_is_japanese() {
-        assert_eq!(UiLocale::default(), UiLocale::Japanese);
+    fn ui_covers_all_subtitle_languages() {
+        // 字幕対応言語＝UI表示言語（Language をそのまま使う）
+        assert_eq!(UiLocale::all().len(), Language::all().len());
+        for l in Language::all() {
+            assert!(!l.strings().display_language.is_empty(), "{l:?}");
+        }
     }
 
     #[test]
@@ -295,11 +876,6 @@ mod tests {
 
     #[test]
     fn templates_fill_in_locale_word_order() {
-        let ja = UiLocale::Japanese.strings();
-        assert_eq!(ja.status_line("X"), "状態: X");
-        assert_eq!(ja.settings_line("Y"), "設定: Y");
-        assert_eq!(ja.listening_text("P"), "🎧 P 聞き取り中...");
-        assert_eq!(ja.unsupported_audio_text("R"), "⚠️ 音声フォーマット未対応: R");
         let en = UiLocale::English.strings();
         assert_eq!(en.status_line("X"), "Status: X");
         assert_eq!(en.settings_line("Y"), "Settings: Y");
@@ -308,6 +884,13 @@ mod tests {
             en.unsupported_audio_text("R"),
             "⚠️ Unsupported audio format: R"
         );
+        let ja = UiLocale::Japanese.strings();
+        assert_eq!(ja.status_line("X"), "状態: X");
+        assert_eq!(ja.listening_text("P"), "🎧 P 聞き取り中...");
+        // RTLロケールも論理順テンプレートのまま埋まる（表示整形は描画側）
+        let ar = UiLocale::Arabic.strings();
+        assert_eq!(ar.status_line("X"), "الحالة: X");
+        assert_eq!(ar.listening_text("P"), "🎧 جارٍ الاستماع (P)...");
     }
 
     fn scratch(name: &str) -> PathBuf {

@@ -333,15 +333,22 @@ impl LumeSubApp {
     fn control_ui(&self, ui: &mut egui::Ui) {
         let locale = self.ui_locale.lock().map(|l| *l).unwrap_or_default();
         let t = locale.strings();
+        // RTLロケール（アラビア語・ヘブライ語）でも崩れないよう表示時に整形する。
+        // RTLを含まない文言はそのまま返る
+        let sh = |s: &str| shape_for_display(s).into_owned();
         ui.heading("LumeSub");
-        ui.label(t.status_line(status_label(self.controller.status(), t)));
+        ui.label(sh(&t.status_line(status_label(self.controller.status(), t))));
         ui.separator();
 
         if let Ok(mut langs) = self.langs.lock() {
-            egui::ComboBox::from_label(t.input_language)
+            egui::ComboBox::from_label(sh(t.input_language))
                 .selected_text(shape_for_display(&source_label(langs.source, t)).into_owned())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut langs.source, SourceLanguage::Auto, t.auto_detect);
+                    ui.selectable_value(
+                        &mut langs.source,
+                        SourceLanguage::Auto,
+                        sh(t.auto_detect),
+                    );
                     for l in Language::all() {
                         ui.selectable_value(
                             &mut langs.source,
@@ -351,7 +358,7 @@ impl LumeSubApp {
                         );
                     }
                 });
-            egui::ComboBox::from_label(t.output_language)
+            egui::ComboBox::from_label(sh(t.output_language))
                 .selected_text(shape_for_display(langs.target.display_name()).into_owned())
                 .show_ui(ui, |ui| {
                     for l in Language::all() {
@@ -365,19 +372,19 @@ impl LumeSubApp {
                 });
             ui.label(shape_for_display(&t.settings_line(&langs.describe())).into_owned());
         } else {
-            ui.colored_label(egui::Color32::RED, t.lang_read_failed);
+            ui.colored_label(egui::Color32::RED, sh(t.lang_read_failed));
         }
-        ui.small(t.input_note);
+        ui.small(sh(t.input_note));
         ui.separator();
 
         // 表示言語の切替。変えたら即保存する
         if let Ok(mut current) = self.ui_locale.lock() {
             let before = *current;
-            egui::ComboBox::from_label(current.strings().display_language)
-                .selected_text(current.display_name())
+            egui::ComboBox::from_label(sh(current.strings().display_language))
+                .selected_text(sh(current.display_name()))
                 .show_ui(ui, |ui| {
                     for l in UiLocale::all() {
-                        ui.selectable_value(&mut *current, *l, l.display_name());
+                        ui.selectable_value(&mut *current, *l, sh(l.display_name()));
                     }
                 });
             if *current != before {
@@ -398,14 +405,14 @@ impl LumeSubApp {
         let status = self.controller.status();
         let (can_start, can_pause, can_stop) = buttons_enabled(status);
         ui.horizontal(|ui| {
-            if ui.add_enabled(can_start, egui::Button::new(t.start)).clicked() {
+            if ui.add_enabled(can_start, egui::Button::new(sh(t.start))).clicked() {
                 self.controller.start();
             }
-            let pause_label = if status == CaptureState::Paused {
+            let pause_label = sh(if status == CaptureState::Paused {
                 t.resume
             } else {
                 t.pause
-            };
+            });
             if ui.add_enabled(can_pause, egui::Button::new(pause_label)).clicked() {
                 if status == CaptureState::Paused {
                     self.controller.start();
@@ -413,10 +420,10 @@ impl LumeSubApp {
                     self.controller.pause();
                 }
             }
-            if ui.add_enabled(can_stop, egui::Button::new(t.stop)).clicked() {
+            if ui.add_enabled(can_stop, egui::Button::new(sh(t.stop))).clicked() {
                 self.controller.stop();
             }
-            if ui.button(t.quit).clicked() {
+            if ui.button(sh(t.quit)).clicked() {
                 self.controller.stop();
                 ui.ctx().send_viewport_cmd_to(
                     egui::ViewportId::ROOT,
@@ -426,7 +433,7 @@ impl LumeSubApp {
         });
         ui.separator();
         // 保存した画面外位置などに迷子になった場合の救済
-        if ui.button(t.reset_position).clicked()
+        if ui.button(sh(t.reset_position)).clicked()
             && let Some(monitor) = ui.ctx().input(|i| i.viewport().monitor_size)
         {
             let size = egui::vec2(geometry::DEFAULT_W, geometry::DEFAULT_H);
@@ -516,7 +523,8 @@ impl eframe::App for LumeSubApp {
                     .lock()
                     .map(|l| l.strings().drag_to_move)
                     .unwrap_or_else(|_| UiLocale::default().strings().drag_to_move);
-                hover::paint_frame(ui, drag);
+                let shaped = shape_for_display(drag);
+                hover::paint_frame(ui, &shaped);
             }
         });
 

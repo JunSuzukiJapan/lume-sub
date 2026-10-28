@@ -7,12 +7,14 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-/// ASR が対応する25言語
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// ASR が対応する25言語。UI表示言語としてもそのまま使う
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Language {
     Arabic,
     Bengali,
     Dutch,
+    /// 既定（UI表示用）
+    #[default]
     English,
     French,
     German,
@@ -270,6 +272,11 @@ mod tests {
         assert_eq!("mandarin".parse::<Language>().unwrap(), Language::Mandarin);
         assert_eq!("zh".parse::<Language>().unwrap(), Language::Mandarin);
         assert!("klingon".parse::<Language>().is_err());
+    }
+
+    #[test]
+    fn default_is_english() {
+        assert_eq!(Language::default(), Language::English);
     }
 
     #[test]
