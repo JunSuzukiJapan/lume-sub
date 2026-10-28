@@ -23,3 +23,5 @@ futures-util = "0.3.34"
 serde_json = "1.0.154"
 serde = { version = "1.0.229", features = ["derive"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+unicode-bidi = "0.3.18"
+arabic_reshaper = "0.4.2"

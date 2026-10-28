@@ -3,6 +3,7 @@ mod audio;
 mod control;
 mod fonts;
 mod language;
+mod text;
 mod translate;
 
 use eframe::egui;
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent};
 use control::{CaptureState, PipelineController, SpawnContext, buttons_enabled};
 use language::{Language, LanguageConfig, SharedLanguageConfig, SourceLanguage, shared};
+use text::shape_for_display;
 use translate::{TRANSLATE_MODEL_DEFAULT, TranslationSession};
 
 pub(crate) enum AppEvent {
@@ -273,29 +275,31 @@ impl LumeSubApp {
 
         if let Ok(mut langs) = self.langs.lock() {
             egui::ComboBox::from_label("入力言語")
-                .selected_text(source_label(langs.source))
+                .selected_text(shape_for_display(&source_label(langs.source)).into_owned())
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut langs.source, SourceLanguage::Auto, "auto（自動検出）");
                     for l in Language::all() {
                         ui.selectable_value(
                             &mut langs.source,
                             SourceLanguage::Specific(*l),
-                            format!("{} ({})", l.display_name(), l.code()),
+                            shape_for_display(&format!("{} ({})", l.display_name(), l.code()))
+                                .into_owned(),
                         );
                     }
                 });
             egui::ComboBox::from_label("出力言語")
-                .selected_text(langs.target.display_name())
+                .selected_text(shape_for_display(langs.target.display_name()).into_owned())
                 .show_ui(ui, |ui| {
                     for l in Language::all() {
                         ui.selectable_value(
                             &mut langs.target,
                             *l,
-                            format!("{} ({})", l.display_name(), l.code()),
+                            shape_for_display(&format!("{} ({})", l.display_name(), l.code()))
+                                .into_owned(),
                         );
                     }
                 });
-            ui.label(format!("設定: {}", langs.describe()));
+            ui.label(shape_for_display(&format!("設定: {}", langs.describe())).into_owned());
         } else {
             ui.colored_label(egui::Color32::RED, "言語設定の読み取りに失敗");
         }
@@ -351,7 +355,7 @@ impl eframe::App for LumeSubApp {
                 ui.add_space(20.0);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(&self.subtitle_text)
+                        egui::RichText::new(shape_for_display(&self.subtitle_text).into_owned())
                             .font(egui::FontId::proportional(28.0))
                             .color(egui::Color32::WHITE)
                             .strong(),
