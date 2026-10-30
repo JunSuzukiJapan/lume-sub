@@ -232,8 +232,9 @@ const PANEL_MOVE_STRIP_H: f32 = 24.0;
 const PANEL_RESIZE_S: f32 = 28.0;
 /// バツの高さ（pt）。ストリップに揃える（幅 26pt・上余白 2ptは通常窓と同じ）
 const PANEL_CLOSE_H: f32 = 24.0;
-/// ホバー枠の上 inset（pt）。字幕地（黒背景）の内側に収めて動画に埋もれないよう
-const PANEL_TOP_INSET: f32 = 12.0;
+/// 字幕地の縁 inset（pt）。横・下。上は端まで伸ばして隙間を作らない
+const FIELD_INSET_X: f32 = 12.0;
+const FIELD_INSET_Y: f32 = 8.0;
 
 /// AppKit枠 (x, 下辺y, w, h) に対するマウス位置の分類。
 /// バツ→角→帯の順に見る。バツ無効時は帯に読み替える
@@ -251,15 +252,15 @@ fn classify_panel_hover(
     if close_enabled
         && mx >= x + w - 30.0
         && mx <= x + w - 4.0
-        && my >= y + h - PANEL_TOP_INSET - 2.0 - PANEL_CLOSE_H
-        && my <= y + h - PANEL_TOP_INSET - 2.0
+        && my >= y + h - 2.0 - PANEL_CLOSE_H
+        && my <= y + h - 2.0
     {
         return PanelHover::Close;
     }
     if mx >= x + w - PANEL_RESIZE_S && my <= y + PANEL_RESIZE_S {
         return PanelHover::Resize;
     }
-    if my >= y + h - PANEL_TOP_INSET - PANEL_MOVE_STRIP_H {
+    if my >= y + h - PANEL_MOVE_STRIP_H {
         return PanelHover::Move;
     }
     PanelHover::Body
@@ -519,22 +520,27 @@ impl FullscreenPanel {
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
 
+        // 字幕地（常時表示）。文言欄はバーの分だけ低く固定し、
+        // ホバによる文言のずれをなくす（通常窓の上余白と同じ）
+        let backdrop = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        backdrop.setDrawsBackground(true);
+        backdrop.setBackgroundColor(Some(&NSColor::blackColor().colorWithAlphaComponent(0.65)));
         let field = NSTextField::labelWithString(&NSString::from_str(""), mtm);
         field.setAlignment(NSTextAlignment(2)); // Center（定数がないため直値）
         // SAFETY: 定数の読み取りのみ
         let bold = unsafe { NSFontWeightBold };
         field.setFont(Some(&NSFont::systemFontOfSize_weight(28.0, bold)));
         field.setTextColor(Some(&NSColor::whiteColor()));
-        field.setDrawsBackground(true);
-        field.setBackgroundColor(Some(&NSColor::blackColor().colorWithAlphaComponent(0.65)));
+        field.setDrawsBackground(false);
 
-        // ホバー枠（通常窓と同寸）。掴み位置の目安で、入力自体はOS照会で捌く
+        // ホバー枠（通常窓と同寸）。掴み位置の目安で、入力自体はOS照会で捌く。
+        // バー地は字幕地と同じ黒にして一体化する
         let strip = NSTextField::labelWithString(&NSString::from_str(""), mtm);
         strip.setAlignment(NSTextAlignment(2)); // Center
         strip.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         strip.setTextColor(Some(&NSColor::whiteColor()));
         strip.setDrawsBackground(true);
-        strip.setBackgroundColor(Some(&NSColor::whiteColor().colorWithAlphaComponent(0.08)));
+        strip.setBackgroundColor(Some(&NSColor::blackColor().colorWithAlphaComponent(0.65)));
         strip.setHidden(true);
         // SAFETY: 既定初期化のみ
         let close_icon: Retained<NSImageView> =
@@ -566,11 +572,34 @@ impl FullscreenPanel {
         }
         if let Some(content) = panel.contentView() {
             let bounds = content.bounds();
-            field.setFrame(NSRect {
-                origin: NSPoint { x: 12.0, y: 8.0 },
+            backdrop.setFrame(NSRect {
+                origin: NSPoint {
+                    x: FIELD_INSET_X as f64,
+                    y: FIELD_INSET_Y as f64,
+                },
                 size: NSSize {
-                    width: (bounds.size.width - 24.0).max(0.0),
-                    height: (bounds.size.height - 16.0).max(0.0),
+                    width: (bounds.size.width - 2.0 * FIELD_INSET_X as f64).max(0.0),
+                    // 上端は欄の上まで伸ばして隙間を作らない
+                    height: (bounds.size.height - FIELD_INSET_Y as f64).max(0.0),
+                },
+            });
+            backdrop.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            content.addSubview(&backdrop);
+            // 文言欄の上端はバーの下端に固定（ホバ前後で不変）
+            field.setFrame(NSRect {
+                origin: NSPoint {
+                    x: FIELD_INSET_X as f64,
+                    y: FIELD_INSET_Y as f64,
+                },
+                size: NSSize {
+                    width: (bounds.size.width - 2.0 * FIELD_INSET_X as f64).max(0.0),
+                    height: (bounds.size.height
+                        - PANEL_MOVE_STRIP_H as f64
+                        - FIELD_INSET_Y as f64)
+                        .max(0.0),
                 },
             });
             field.setAutoresizingMask(
@@ -580,11 +609,12 @@ impl FullscreenPanel {
             content.addSubview(&field);
             strip.setFrame(NSRect {
                 origin: NSPoint {
-                    x: 0.0,
-                    y: bounds.size.height - PANEL_TOP_INSET as f64 - PANEL_MOVE_STRIP_H as f64,
+                    // 字幕地の左右に揃える（文言は字幕の中央に来る）
+                    x: FIELD_INSET_X as f64,
+                    y: bounds.size.height - PANEL_MOVE_STRIP_H as f64,
                 },
                 size: NSSize {
-                    width: (bounds.size.width - 34.0).max(0.0),
+                    width: (bounds.size.width - 2.0 * FIELD_INSET_X as f64).max(0.0),
                     height: PANEL_MOVE_STRIP_H as f64,
                 },
             });
@@ -596,10 +626,7 @@ impl FullscreenPanel {
             close_icon.setFrame(NSRect {
                 origin: NSPoint {
                     x: bounds.size.width - 30.0,
-                    y: bounds.size.height
-                        - PANEL_TOP_INSET as f64
-                        - 2.0
-                        - PANEL_CLOSE_H as f64,
+                    y: bounds.size.height - 2.0 - PANEL_CLOSE_H as f64,
                 },
                 size: NSSize {
                     width: 26.0,
@@ -681,7 +708,8 @@ impl FullscreenPanel {
     }
 
     /// ホバー枠（移動バー・バツ・グリップ）の表示と文言を整える。
-    /// 掴める位置の目安で、入力の透過切替は別途行う
+    /// 掴める位置の目安で、入力の透過切替は別途行う。
+    /// 文言欄は初めからバーの下に固定してあるため、ここでは動かさない
     fn set_hover_frame(&mut self, show: bool, close_enabled: bool, hint: &str) {
         use objc2_foundation::NSString;
 
@@ -919,11 +947,7 @@ mod tests {
             PanelHover::Move
         );
         assert_eq!(
-            classify_panel_hover(f, (400.0, 315.0), true),
-            PanelHover::Move
-        );
-        assert_eq!(
-            classify_panel_hover(f, (400.0, 313.0), true),
+            classify_panel_hover(f, (400.0, 325.0), true),
             PanelHover::Body
         );
         // 右下角＝リサイズ（右辺 900 の左 28pt × 下辺 200 の上 28pt）
@@ -974,9 +998,9 @@ mod tests {
     #[test]
     fn close_region_priority() {
         let f = panel();
-        // 右上のバツ（右辺 900 の左 30〜4pt × 上辺 350 の下 38〜14pt）
+        // 右上のバツ（右辺 900 の左 30〜4pt × 上辺 350 の下 26〜2pt）
         assert_eq!(
-            classify_panel_hover(f, (880.0, 330.0), true),
+            classify_panel_hover(f, (880.0, 340.0), true),
             PanelHover::Close
         );
         assert_eq!(
@@ -984,21 +1008,17 @@ mod tests {
             PanelHover::Close
         );
         assert_eq!(
-            classify_panel_hover(f, (880.0, 311.0), true),
+            classify_panel_hover(f, (880.0, 323.0), true),
             PanelHover::Body
         );
-        // バツの上・左隣は帯のまま
+        // バツの左隣は帯のまま
         assert_eq!(
-            classify_panel_hover(f, (880.0, 340.0), true),
-            PanelHover::Move
-        );
-        assert_eq!(
-            classify_panel_hover(f, (860.0, 330.0), true),
+            classify_panel_hover(f, (860.0, 340.0), true),
             PanelHover::Move
         );
         // バツ無効時は帯に読み替える
         assert_eq!(
-            classify_panel_hover(f, (880.0, 330.0), false),
+            classify_panel_hover(f, (880.0, 340.0), false),
             PanelHover::Move
         );
     }
