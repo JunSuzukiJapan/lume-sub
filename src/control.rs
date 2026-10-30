@@ -18,8 +18,9 @@ use tokio::sync::mpsc;
 use crate::AppEvent;
 use crate::asr::{AsrConfig, AsrEvent, supervise};
 use crate::audio::{AudioFrame, extract_audio_frame, format_audio_status};
-use crate::i18n::{SharedUiLocale, UiLocale};
+use crate::i18n::UiLocale;
 use crate::language::SharedLanguageConfig;
+use crate::store::SharedStore;
 
 /// キャプチャの状態
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +80,7 @@ struct AudioOutputHandler {
     muted: Arc<AtomicBool>,
     counter: AtomicUsize,
     asr_enabled: bool,
-    ui_locale: SharedUiLocale,
+    store: SharedStore,
 }
 
 impl SCStreamOutputTrait for AudioOutputHandler {
@@ -91,13 +92,13 @@ impl SCStreamOutputTrait for AudioOutputHandler {
             Ok(frame) => frame,
             Err(reason) => {
                 let text = self
-                    .ui_locale
+                    .store
                     .lock()
-                    .map(|l| l.strings().unsupported_audio_text(&reason))
+                    .map(|s| s.ui_locale().strings().unsupported_audio_text(&reason))
                     .unwrap_or_else(|_| {
                         UiLocale::default().strings().unsupported_audio_text(&reason)
                     });
-                let _ = self.gui_tx.try_send(AppEvent::UpdateSubtitle(text));
+                let _ = self.gui_tx.try_send(AppEvent::UpdateSource(text));
                 return;
             }
         };
@@ -112,7 +113,7 @@ impl SCStreamOutputTrait for AudioOutputHandler {
                 frame.rms,
                 count,
             );
-            let _ = self.gui_tx.try_send(AppEvent::UpdateSubtitle(status));
+            let _ = self.gui_tx.try_send(AppEvent::UpdateSource(status));
         }
         // 満杯なら破棄（リアルタイム優先）
         let _ = self.audio_tx.try_send(frame);
@@ -130,7 +131,7 @@ pub struct SpawnContext {
     /// None のとき ASR は起動せず音声レベルのみ
     pub asr_config: Option<AsrConfig>,
     pub langs: SharedLanguageConfig,
-    pub ui_locale: SharedUiLocale,
+    pub store: SharedStore,
 }
 
 struct PipelineInner {
@@ -223,7 +224,7 @@ fn spawn_session(ctx: &SpawnContext) -> CaptureHandle {
         ctx.gui_tx.clone(),
         audio_tx,
         asr_enabled,
-        ctx.ui_locale.clone(),
+        ctx.store.clone(),
     );
     if let Some(cfg) = &ctx.asr_config {
         ctx.tokio.spawn(supervise(
@@ -249,7 +250,7 @@ fn spawn_capture(
     gui_tx: mpsc::Sender<AppEvent>,
     audio_tx: mpsc::Sender<AudioFrame>,
     asr_enabled: bool,
-    ui_locale: SharedUiLocale,
+    store: SharedStore,
 ) -> CaptureHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<CaptureCmd>(4);
     let muted = Arc::new(AtomicBool::new(false));
@@ -292,7 +293,7 @@ fn spawn_capture(
             muted,
             counter: AtomicUsize::new(0),
             asr_enabled,
-            ui_locale,
+            store,
         };
         stream
             .add_output_handler(handler, SCStreamOutputType::Audio)

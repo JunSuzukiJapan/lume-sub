@@ -7,8 +7,10 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 /// ASR が対応する25言語。UI表示言語としてもそのまま使う
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Language {
     Arabic,
     Bengali,
@@ -165,7 +167,7 @@ impl FromStr for Language {
 }
 
 /// 入力言語。Auto はモデルに検出させる
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SourceLanguage {
     #[default]
     Auto,
@@ -184,10 +186,16 @@ impl FromStr for SourceLanguage {
     }
 }
 
+fn default_target() -> Language {
+    Language::Japanese
+}
+
 /// 入出力言語の組
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageConfig {
+    #[serde(default)]
     pub source: SourceLanguage,
+    #[serde(default = "default_target")]
     pub target: Language,
 }
 
@@ -201,31 +209,6 @@ impl Default for LanguageConfig {
 }
 
 impl LanguageConfig {
-    /// `SOURCE_LANG`（既定 auto）・`TARGET_LANG`（既定 日本語）から読む
-    pub fn from_env() -> Self {
-        let source = std::env::var("SOURCE_LANG")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .map(|v| {
-                v.parse().unwrap_or_else(|e: String| {
-                    println!("⚠️ {e}（入力言語は自動検出にします）");
-                    SourceLanguage::Auto
-                })
-            })
-            .unwrap_or_default();
-        let target = std::env::var("TARGET_LANG")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .map(|v| {
-                v.parse().unwrap_or_else(|e: String| {
-                    println!("⚠️ {e}（出力言語は日本語にします）");
-                    Language::Japanese
-                })
-            })
-            .unwrap_or(Language::Japanese);
-        Self { source, target }
-    }
-
     /// ASR ハンドシェイクの `languageBias` 用。自動検出時は None
     pub fn language_bias(&self) -> Option<Vec<String>> {
         match self.source {

@@ -4,10 +4,7 @@
 //! 字幕メッセージなどのUI文言も表示できる。既定は英語。
 //! 全文言は [`UiStrings`] ひとつに集約し、[`Language::strings`] で取得する。
 //! 文言を足すときは全ロケールの定数と網羅テストに足すこと。
-//! 選択は `~/.config/lume-sub/ui_locale.json` に保存し、次回起動時に復元する。
-
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+//! 選択は [`crate::store::Store`] に保存し、次回起動時に復元する。
 
 use crate::language::Language;
 
@@ -38,6 +35,17 @@ pub struct UiStrings {
     pub connecting: &'static str,
     pub play_prompt: &'static str,
     pub drag_to_move: &'static str,
+    pub settings_button: &'static str,
+    pub settings_title: &'static str,
+    pub api_key: &'static str,
+    pub base_url: &'static str,
+    pub asr_model: &'static str,
+    pub translate_model: &'static str,
+    pub save: &'static str,
+    pub close: &'static str,
+    pub settings_restart_note: &'static str,
+    pub show_source: &'static str,
+    pub show_translation: &'static str,
     tpl_status_line: &'static str,
     tpl_settings_line: &'static str,
     tpl_listening: &'static str,
@@ -91,6 +99,17 @@ const AR_STRINGS: UiStrings = UiStrings {
     connecting: "جارٍ الاتصال بخدمة ASR...",
     play_prompt: "شغّل شيئًا يحتوي على صوت (مثل YouTube)...",
     drag_to_move: "اسحب للتحريك",
+    settings_button: "⚙ الإعدادات...",
+    settings_title: "LumeSub Settings",
+    api_key: "مفتاح API",
+    base_url: "Base URL",
+    asr_model: "نموذج ASR",
+    translate_model: "نموذج الترجمة",
+    save: "حفظ",
+    close: "إغلاق",
+    settings_restart_note: "تدخل الإعدادات المحفوظة حيز التنفيذ من التشغيل التالي.",
+    show_source: "إظهار نافذة النص الأصلي",
+    show_translation: "إظهار نافذة الترجمة",
     tpl_status_line: "الحالة: {}",
     tpl_settings_line: "الإعدادات: {}",
     tpl_listening: "🎧 جارٍ الاستماع ({})...",
@@ -118,6 +137,17 @@ const BN_STRINGS: UiStrings = UiStrings {
     connecting: "ASR-এ সংযোগ করা হচ্ছে...",
     play_prompt: "অডিও আছে এমন কিছু চালান (যেমন YouTube)...",
     drag_to_move: "সরাতে টেনে আনুন",
+    settings_button: "⚙ সেটিংস...",
+    settings_title: "LumeSub Settings",
+    api_key: "API কী",
+    base_url: "Base URL",
+    asr_model: "ASR মডেল",
+    translate_model: "অনুবাদ মডেল",
+    save: "সংরক্ষণ",
+    close: "বন্ধ",
+    settings_restart_note: "সংরক্ষিত সেটিংস পরবর্তী চালু থেকে কার্যকর হবে।",
+    show_source: "উৎস উইন্ডো দেখান",
+    show_translation: "অনুবাদ উইন্ডো দেখান",
     tpl_status_line: "অবস্থা: {}",
     tpl_settings_line: "সেটিং: {}",
     tpl_listening: "🎧 শোনা হচ্ছে ({})...",
@@ -145,6 +175,17 @@ const NL_STRINGS: UiStrings = UiStrings {
     connecting: "Verbinden met ASR...",
     play_prompt: "Speel iets met audio af (bijv. YouTube)...",
     drag_to_move: "slepen om te verplaatsen",
+    settings_button: "⚙ Instellingen...",
+    settings_title: "LumeSub Settings",
+    api_key: "API-sleutel",
+    base_url: "Basis-URL",
+    asr_model: "ASR-model",
+    translate_model: "Vertaalmodel",
+    save: "Opslaan",
+    close: "Sluiten",
+    settings_restart_note: "Opgeslagen instellingen zijn van kracht vanaf de volgende start.",
+    show_source: "Bronvenster tonen",
+    show_translation: "Vertaalvenster tonen",
     tpl_status_line: "Status: {}",
     tpl_settings_line: "Instellingen: {}",
     tpl_listening: "🎧 Luisteren ({})...",
@@ -172,6 +213,17 @@ const EN_STRINGS: UiStrings = UiStrings {
     connecting: "Connecting to ASR...",
     play_prompt: "Play something with audio (e.g. YouTube)...",
     drag_to_move: "drag to move",
+    settings_button: "⚙ Settings...",
+    settings_title: "LumeSub Settings",
+    api_key: "API key",
+    base_url: "Base URL",
+    asr_model: "ASR model",
+    translate_model: "Translation model",
+    save: "Save",
+    close: "Close",
+    settings_restart_note: "Saved settings take effect from the next launch.",
+    show_source: "Show source window",
+    show_translation: "Show translation window",
     tpl_status_line: "Status: {}",
     tpl_settings_line: "Settings: {}",
     tpl_listening: "🎧 Listening ({})...",
@@ -199,6 +251,17 @@ const FR_STRINGS: UiStrings = UiStrings {
     connecting: "Connexion à l'ASR...",
     play_prompt: "Lisez un contenu avec audio (p. ex. YouTube)...",
     drag_to_move: "glisser pour déplacer",
+    settings_button: "⚙ Paramètres...",
+    settings_title: "LumeSub Settings",
+    api_key: "Clé API",
+    base_url: "URL de base",
+    asr_model: "Modèle ASR",
+    translate_model: "Modèle de traduction",
+    save: "Enregistrer",
+    close: "Fermer",
+    settings_restart_note: "Les paramètres enregistrés prendront effet au prochain démarrage.",
+    show_source: "Afficher la fenêtre source",
+    show_translation: "Afficher la fenêtre de traduction",
     tpl_status_line: "Statut : {}",
     tpl_settings_line: "Paramètres : {}",
     tpl_listening: "🎧 Écoute ({})...",
@@ -226,6 +289,17 @@ const DE_STRINGS: UiStrings = UiStrings {
     connecting: "Verbinde mit ASR...",
     play_prompt: "Etwas mit Ton abspielen (z. B. YouTube)...",
     drag_to_move: "zum Verschieben ziehen",
+    settings_button: "⚙ Einstellungen...",
+    settings_title: "LumeSub Settings",
+    api_key: "API-Schlüssel",
+    base_url: "Basis-URL",
+    asr_model: "ASR-Modell",
+    translate_model: "Übersetzungsmodell",
+    save: "Speichern",
+    close: "Schließen",
+    settings_restart_note: "Gespeicherte Einstellungen gelten ab dem nächsten Start.",
+    show_source: "Quellfenster anzeigen",
+    show_translation: "Übersetzungsfenster anzeigen",
     tpl_status_line: "Status: {}",
     tpl_settings_line: "Einstellungen: {}",
     tpl_listening: "🎧 Höre zu ({})...",
@@ -253,6 +327,17 @@ const HE_STRINGS: UiStrings = UiStrings {
     connecting: "מתחבר ל-ASR...",
     play_prompt: "הפעל תוכן עם שמע (למשל YouTube)...",
     drag_to_move: "גרור להזזה",
+    settings_button: "⚙ הגדרות...",
+    settings_title: "LumeSub Settings",
+    api_key: "מפתח API",
+    base_url: "Base URL",
+    asr_model: "מודל ASR",
+    translate_model: "מודל תרגום",
+    save: "שמור",
+    close: "סגור",
+    settings_restart_note: "ההגדרות השמורות ייכנסו לתוקף מההפעלה הבאה.",
+    show_source: "הצג חלון מקור",
+    show_translation: "הצג חלון תרגום",
     tpl_status_line: "סטטוס: {}",
     tpl_settings_line: "הגדרות: {}",
     tpl_listening: "🎧 מקשיב ({})...",
@@ -280,6 +365,17 @@ const HI_STRINGS: UiStrings = UiStrings {
     connecting: "ASR से कनेक्ट हो रहा है...",
     play_prompt: "ऑडियो वाली कोई चीज़ चलाएँ (जैसे YouTube)...",
     drag_to_move: "ले जाने के लिए खींचें",
+    settings_button: "⚙ सेटिंग...",
+    settings_title: "LumeSub Settings",
+    api_key: "API कुंजी",
+    base_url: "बेस URL",
+    asr_model: "ASR मॉडल",
+    translate_model: "अनुवाद मॉडल",
+    save: "सहेजें",
+    close: "बंद करें",
+    settings_restart_note: "सहेजी गई सेटिंग अगले स्टार्ट से लागू होंगी।",
+    show_source: "स्रोत विंडो दिखाएँ",
+    show_translation: "अनुवाद विंडो दिखाएँ",
     tpl_status_line: "स्थिति: {}",
     tpl_settings_line: "सेटिंग: {}",
     tpl_listening: "🎧 सुन रहे हैं ({})...",
@@ -307,6 +403,17 @@ const ID_STRINGS: UiStrings = UiStrings {
     connecting: "Menghubungkan ke ASR...",
     play_prompt: "Putar sesuatu dengan audio (mis. YouTube)...",
     drag_to_move: "seret untuk memindahkan",
+    settings_button: "⚙ Pengaturan...",
+    settings_title: "LumeSub Settings",
+    api_key: "Kunci API",
+    base_url: "URL dasar",
+    asr_model: "Model ASR",
+    translate_model: "Model terjemahan",
+    save: "Simpan",
+    close: "Tutup",
+    settings_restart_note: "Pengaturan yang disimpan berlaku mulai peluncuran berikutnya.",
+    show_source: "Tampilkan jendela sumber",
+    show_translation: "Tampilkan jendela terjemahan",
     tpl_status_line: "Status: {}",
     tpl_settings_line: "Pengaturan: {}",
     tpl_listening: "🎧 Mendengarkan ({})...",
@@ -334,6 +441,17 @@ const IT_STRINGS: UiStrings = UiStrings {
     connecting: "Connessione ad ASR...",
     play_prompt: "Riproduci qualcosa con audio (es. YouTube)...",
     drag_to_move: "trascina per spostare",
+    settings_button: "⚙ Impostazioni...",
+    settings_title: "LumeSub Settings",
+    api_key: "Chiave API",
+    base_url: "URL di base",
+    asr_model: "Modello ASR",
+    translate_model: "Modello di traduzione",
+    save: "Salva",
+    close: "Chiudi",
+    settings_restart_note: "Le impostazioni salvate saranno effettive dal prossimo avvio.",
+    show_source: "Mostra finestra sorgente",
+    show_translation: "Mostra finestra traduzione",
     tpl_status_line: "Stato: {}",
     tpl_settings_line: "Impostazioni: {}",
     tpl_listening: "🎧 In ascolto ({})...",
@@ -361,6 +479,17 @@ const JA_STRINGS: UiStrings = UiStrings {
     connecting: "ASRに接続中...",
     play_prompt: "YouTubeなどを再生して音を鳴らしてください...",
     drag_to_move: "ドラッグで移動",
+    settings_button: "⚙ 設定...",
+    settings_title: "LumeSub Settings",
+    api_key: "APIキー",
+    base_url: "ベースURL",
+    asr_model: "ASRモデル",
+    translate_model: "翻訳モデル",
+    save: "保存",
+    close: "閉じる",
+    settings_restart_note: "保存した設定は次回起動から使われます。",
+    show_source: "原文ウィンドウを表示",
+    show_translation: "翻訳ウィンドウを表示",
     tpl_status_line: "状態: {}",
     tpl_settings_line: "設定: {}",
     tpl_listening: "🎧 {} 聞き取り中...",
@@ -388,6 +517,17 @@ const KN_STRINGS: UiStrings = UiStrings {
     connecting: "ASR ಗೆ ಸಂಪರ್ಕಿಸಲಾಗುತ್ತಿದೆ...",
     play_prompt: "ಆಡಿಯೋ ಇರುವ ಏನನ್ನಾದರೂ ಪ್ಲೇ ಮಾಡಿ (ಉದಾ. YouTube)...",
     drag_to_move: "ಸರಿಸಲು ಎಳೆಯಿರಿ",
+    settings_button: "⚙ ಸೆಟ್ಟಿಂಗ್‌ಗಳು...",
+    settings_title: "LumeSub Settings",
+    api_key: "API ಕೀ",
+    base_url: "ಬೇಸ್ URL",
+    asr_model: "ASR ಮಾದರಿ",
+    translate_model: "ಅನುವಾದ ಮಾದರಿ",
+    save: "ಉಳಿಸಿ",
+    close: "ಮುಚ್ಚಿ",
+    settings_restart_note: "ಉಳಿಸಿದ ಸೆಟ್ಟಿಂಗ್‌ಗಳು ಮುಂದಿನ ಆರಂಭದಿಂದ ಜಾರಿಗೆ ಬರುತ್ತವೆ.",
+    show_source: "ಮೂಲ ವಿಂಡೋ ತೋರಿಸಿ",
+    show_translation: "ಅನುವಾದ ವಿಂಡೋ ತೋರಿಸಿ",
     tpl_status_line: "ಸ್ಥಿತಿ: {}",
     tpl_settings_line: "ಸೆಟ್ಟಿಂಗ್‌ಗಳು: {}",
     tpl_listening: "🎧 ಆಲಿಸಲಾಗುತ್ತಿದೆ ({})...",
@@ -415,6 +555,17 @@ const KO_STRINGS: UiStrings = UiStrings {
     connecting: "ASR에 연결 중...",
     play_prompt: "오디오가 있는 콘텐츠를 재생하세요(예: YouTube)...",
     drag_to_move: "드래그하여 이동",
+    settings_button: "⚙ 설정...",
+    settings_title: "LumeSub Settings",
+    api_key: "API 키",
+    base_url: "기본 URL",
+    asr_model: "ASR 모델",
+    translate_model: "번역 모델",
+    save: "저장",
+    close: "닫기",
+    settings_restart_note: "저장한 설정은 다음 실행부터 적용됩니다.",
+    show_source: "원문 창 표시",
+    show_translation: "번역 창 표시",
     tpl_status_line: "상태: {}",
     tpl_settings_line: "설정: {}",
     tpl_listening: "🎧 수신 중({})...",
@@ -442,6 +593,17 @@ const MS_STRINGS: UiStrings = UiStrings {
     connecting: "Menyambung ke ASR...",
     play_prompt: "Mainkan sesuatu dengan audio (cth. YouTube)...",
     drag_to_move: "seret untuk mengalih",
+    settings_button: "⚙ Tetapan...",
+    settings_title: "LumeSub Settings",
+    api_key: "Kunci API",
+    base_url: "URL asas",
+    asr_model: "Model ASR",
+    translate_model: "Model terjemahan",
+    save: "Simpan",
+    close: "Tutup",
+    settings_restart_note: "Tetapan yang disimpan berkuat kuasa mulai pelancaran seterusnya.",
+    show_source: "Tunjukkan tetingkap sumber",
+    show_translation: "Tunjukkan tetingkap terjemahan",
     tpl_status_line: "Status: {}",
     tpl_settings_line: "Tetapan: {}",
     tpl_listening: "🎧 Mendengar ({})...",
@@ -469,6 +631,17 @@ const ZH_STRINGS: UiStrings = UiStrings {
     connecting: "正在连接 ASR...",
     play_prompt: "请播放带音频的内容（例如 YouTube）...",
     drag_to_move: "拖动以移动",
+    settings_button: "⚙ 设置...",
+    settings_title: "LumeSub Settings",
+    api_key: "API 密钥",
+    base_url: "基础 URL",
+    asr_model: "ASR 模型",
+    translate_model: "翻译模型",
+    save: "保存",
+    close: "关闭",
+    settings_restart_note: "已保存的设置将从下次启动开始生效。",
+    show_source: "显示原文窗口",
+    show_translation: "显示译文窗口",
     tpl_status_line: "状态：{}",
     tpl_settings_line: "设置：{}",
     tpl_listening: "🎧 正在收听（{}）...",
@@ -496,6 +669,17 @@ const MR_STRINGS: UiStrings = UiStrings {
     connecting: "ASR शी कनेक्ट होत आहे...",
     play_prompt: "ऑडिओ असलेले काहीतरी प्ले करा (उदा. YouTube)...",
     drag_to_move: "हलवण्यासाठी ओढा",
+    settings_button: "⚙ सेटिंग्ज...",
+    settings_title: "LumeSub Settings",
+    api_key: "API की",
+    base_url: "बेस URL",
+    asr_model: "ASR मॉडेल",
+    translate_model: "भाषांतर मॉडेल",
+    save: "जतन करा",
+    close: "बंद करा",
+    settings_restart_note: "जतन केलेल्या सेटिंग्ज पुढील सुरुवातीपासून लागू होतील.",
+    show_source: "स्रोत विंडो दाखवा",
+    show_translation: "भाषांतर विंडो दाखवा",
     tpl_status_line: "स्थिती: {}",
     tpl_settings_line: "सेटिंग्ज: {}",
     tpl_listening: "🎧 ऐकत आहे ({})...",
@@ -523,6 +707,17 @@ const PL_STRINGS: UiStrings = UiStrings {
     connecting: "Łączenie z ASR...",
     play_prompt: "Odtwórz coś z dźwiękiem (np. YouTube)...",
     drag_to_move: "przeciągnij, aby przenieść",
+    settings_button: "⚙ Ustawienia...",
+    settings_title: "LumeSub Settings",
+    api_key: "Klucz API",
+    base_url: "Bazowy URL",
+    asr_model: "Model ASR",
+    translate_model: "Model tłumaczenia",
+    save: "Zapisz",
+    close: "Zamknij",
+    settings_restart_note: "Zapisane ustawienia zaczną obowiązywać od następnego uruchomienia.",
+    show_source: "Pokaż okno źródłowe",
+    show_translation: "Pokaż okno tłumaczenia",
     tpl_status_line: "Stan: {}",
     tpl_settings_line: "Ustawienia: {}",
     tpl_listening: "🎧 Słuchanie ({})...",
@@ -550,6 +745,17 @@ const PT_STRINGS: UiStrings = UiStrings {
     connecting: "Conectando ao ASR...",
     play_prompt: "Reproduza algo com áudio (ex.: YouTube)...",
     drag_to_move: "arraste para mover",
+    settings_button: "⚙ Configurações...",
+    settings_title: "LumeSub Settings",
+    api_key: "Chave de API",
+    base_url: "URL base",
+    asr_model: "Modelo ASR",
+    translate_model: "Modelo de tradução",
+    save: "Salvar",
+    close: "Fechar",
+    settings_restart_note: "As configurações salvas terão efeito a partir da próxima inicialização.",
+    show_source: "Mostrar janela de origem",
+    show_translation: "Mostrar janela de tradução",
     tpl_status_line: "Status: {}",
     tpl_settings_line: "Configurações: {}",
     tpl_listening: "🎧 Ouvindo ({})...",
@@ -577,6 +783,17 @@ const ES_STRINGS: UiStrings = UiStrings {
     connecting: "Conectando con ASR...",
     play_prompt: "Reproduce algo con audio (p. ej., YouTube)...",
     drag_to_move: "arrastra para mover",
+    settings_button: "⚙ Ajustes...",
+    settings_title: "LumeSub Settings",
+    api_key: "Clave de API",
+    base_url: "URL base",
+    asr_model: "Modelo ASR",
+    translate_model: "Modelo de traducción",
+    save: "Guardar",
+    close: "Cerrar",
+    settings_restart_note: "Los ajustes guardados tendrán efecto a partir del próximo inicio.",
+    show_source: "Mostrar ventana de origen",
+    show_translation: "Mostrar ventana de traducción",
     tpl_status_line: "Estado: {}",
     tpl_settings_line: "Ajustes: {}",
     tpl_listening: "🎧 Escuchando ({})...",
@@ -604,6 +821,17 @@ const TL_STRINGS: UiStrings = UiStrings {
     connecting: "Kumokonekta sa ASR...",
     play_prompt: "Mag-play ng bagay na may audio (hal. YouTube)...",
     drag_to_move: "i-drag upang ilipat",
+    settings_button: "⚙ Mga setting...",
+    settings_title: "LumeSub Settings",
+    api_key: "API key",
+    base_url: "Base URL",
+    asr_model: "Modelong ASR",
+    translate_model: "Modelong pagsasalin",
+    save: "I-save",
+    close: "Isara",
+    settings_restart_note: "Magkakabisa ang mga na-save na setting sa susunod na pagbukas.",
+    show_source: "Ipakita ang source window",
+    show_translation: "Ipakita ang translation window",
     tpl_status_line: "Katayuan: {}",
     tpl_settings_line: "Mga setting: {}",
     tpl_listening: "🎧 Nakikinig ({})...",
@@ -631,6 +859,17 @@ const TA_STRINGS: UiStrings = UiStrings {
     connecting: "ASR உடன் இணைக்கிறது...",
     play_prompt: "ஒலியுள்ள ஏதாவது இயக்குங்கள் (எ.கா. YouTube)...",
     drag_to_move: "நகர்த்த இழுக்கவும்",
+    settings_button: "⚙ அமைப்புகள்...",
+    settings_title: "LumeSub Settings",
+    api_key: "API விசை",
+    base_url: "அடிப்படை URL",
+    asr_model: "ASR மாதிரி",
+    translate_model: "மொழிபெயர்ப்பு மாதிரி",
+    save: "சேமி",
+    close: "மூடு",
+    settings_restart_note: "சேமித்த அமைப்புகள் அடுத்த தொடக்கத்திலிருந்து நடைமுறைக்கு வரும்.",
+    show_source: "மூல சாளரத்தைக் காட்டு",
+    show_translation: "மொழிபெயர்ப்பு சாளரத்தைக் காட்டு",
     tpl_status_line: "நிலை: {}",
     tpl_settings_line: "அமைப்புகள்: {}",
     tpl_listening: "🎧 கேட்கிறது ({})...",
@@ -658,6 +897,17 @@ const TE_STRINGS: UiStrings = UiStrings {
     connecting: "ASR కు కనెక్ట్ అవుతోంది...",
     play_prompt: "ఆడియో ఉన్నదేదైనా ప్లే చేయండి (ఉదా. YouTube)...",
     drag_to_move: "తరలించడానికి లాగండి",
+    settings_button: "⚙ సెట్టింగ్‌లు...",
+    settings_title: "LumeSub Settings",
+    api_key: "API కీ",
+    base_url: "బేస్ URL",
+    asr_model: "ASR మోడల్",
+    translate_model: "అనువాద మోడల్",
+    save: "సేవ్ చేయి",
+    close: "మూసివేయి",
+    settings_restart_note: "సేవ్ చేసిన సెట్టింగ్‌లు తదుపరి ప్రారంభం నుండి అమలులోకి వస్తాయి.",
+    show_source: "మూల విండోను చూపించు",
+    show_translation: "అనువాద విండోను చూపించు",
     tpl_status_line: "స్థితి: {}",
     tpl_settings_line: "సెట్టింగ్‌లు: {}",
     tpl_listening: "🎧 వింటోంది ({})...",
@@ -685,6 +935,17 @@ const TH_STRINGS: UiStrings = UiStrings {
     connecting: "กำลังเชื่อมต่อกับ ASR...",
     play_prompt: "เล่นสิ่งที่มีเสียง (เช่น YouTube)...",
     drag_to_move: "ลากเพื่อย้าย",
+    settings_button: "⚙ การตั้งค่า...",
+    settings_title: "LumeSub Settings",
+    api_key: "คีย์ API",
+    base_url: "URL หลัก",
+    asr_model: "โมเดล ASR",
+    translate_model: "โมเดลแปลภาษา",
+    save: "บันทึก",
+    close: "ปิด",
+    settings_restart_note: "การตั้งค่าที่บันทึกจะมีผลตั้งแต่การเปิดครั้งถัดไป",
+    show_source: "แสดงหน้าต่างต้นฉบับ",
+    show_translation: "แสดงหน้าต่างคำแปล",
     tpl_status_line: "สถานะ: {}",
     tpl_settings_line: "การตั้งค่า: {}",
     tpl_listening: "🎧 กำลังฟัง ({})...",
@@ -712,6 +973,17 @@ const TR_STRINGS: UiStrings = UiStrings {
     connecting: "ASR'ye bağlanılıyor...",
     play_prompt: "Sesli bir şey oynatın (örn. YouTube)...",
     drag_to_move: "taşımak için sürükleyin",
+    settings_button: "⚙ Ayarlar...",
+    settings_title: "LumeSub Settings",
+    api_key: "API anahtarı",
+    base_url: "Temel URL",
+    asr_model: "ASR modeli",
+    translate_model: "Çeviri modeli",
+    save: "Kaydet",
+    close: "Kapat",
+    settings_restart_note: "Kaydedilen ayarlar bir sonraki başlatmadan itibaren geçerli olur.",
+    show_source: "Kaynak pencereyi göster",
+    show_translation: "Çeviri penceresini göster",
     tpl_status_line: "Durum: {}",
     tpl_settings_line: "Ayarlar: {}",
     tpl_listening: "🎧 Dinleniyor ({})...",
@@ -739,6 +1011,17 @@ const VI_STRINGS: UiStrings = UiStrings {
     connecting: "Đang kết nối tới ASR...",
     play_prompt: "Phát nội dung có âm thanh (ví dụ: YouTube)...",
     drag_to_move: "kéo để di chuyển",
+    settings_button: "⚙ Cài đặt...",
+    settings_title: "LumeSub Settings",
+    api_key: "Khóa API",
+    base_url: "URL cơ sở",
+    asr_model: "Mô hình ASR",
+    translate_model: "Mô hình dịch",
+    save: "Lưu",
+    close: "Đóng",
+    settings_restart_note: "Cài đặt đã lưu sẽ có hiệu lực từ lần khởi động tiếp theo.",
+    show_source: "Hiện cửa sổ nguồn",
+    show_translation: "Hiện cửa sổ bản dịch",
     tpl_status_line: "Trạng thái: {}",
     tpl_settings_line: "Cài đặt: {}",
     tpl_listening: "🎧 Đang nghe ({})...",
@@ -793,56 +1076,6 @@ impl Language {
     }
 }
 
-/// 保存先。`~/.config/lume-sub/ui_locale.json`（`XDG_CONFIG_HOME` 尊重）
-pub fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("lume-sub").join("ui_locale.json"))
-}
-
-/// 保存済みロケールを読む。存在しない・壊れている場合は None
-pub fn load(path: &std::path::Path) -> Option<UiLocale> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            println!("⚠️ 表示言語ファイルを読めません（{}）: {e}", path.display());
-            return None;
-        }
-    };
-    let code: String = match serde_json::from_str(&text) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("⚠️ 表示言語ファイルが壊れています（{}）: {e}", path.display());
-            return None;
-        }
-    };
-    match code.parse() {
-        Ok(l) => Some(l),
-        Err(e) => {
-            println!("⚠️ 表示言語ファイルが壊れています（{}）: {e}", path.display());
-            None
-        }
-    }
-}
-
-/// ロケールを保存する。親ディレクトリがなければ作る
-pub fn save(path: &std::path::Path, locale: UiLocale) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let text = serde_json::to_string_pretty(&locale.code()).expect("locale serialization");
-    std::fs::write(path, text)
-}
-
-/// GUI とバックグラウンドタスクで共有する表示言語。操作ウィンドウから実行時変更する
-pub type SharedUiLocale = Arc<Mutex<UiLocale>>;
-
-pub fn shared(locale: UiLocale) -> SharedUiLocale {
-    Arc::new(Mutex::new(locale))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +1120,17 @@ mod tests {
                 t.connecting,
                 t.play_prompt,
                 t.drag_to_move,
+                t.settings_button,
+                t.settings_title,
+                t.api_key,
+                t.base_url,
+                t.asr_model,
+                t.translate_model,
+                t.save,
+                t.close,
+                t.settings_restart_note,
+                t.show_source,
+                t.show_translation,
             ] {
                 assert!(!s.is_empty(), "{l:?} has an empty string");
             }
@@ -918,32 +1162,5 @@ mod tests {
         let ar = UiLocale::Arabic.strings();
         assert_eq!(ar.status_line("X"), "الحالة: X");
         assert_eq!(ar.listening_text("P"), "🎧 جارٍ الاستماع (P)...");
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("lume-sub-locale-{}-{name}.json", std::process::id()))
-    }
-
-    #[test]
-    fn roundtrip_save_load() {
-        for l in UiLocale::all() {
-            let path = scratch(l.code());
-            save(&path, *l).unwrap();
-            assert_eq!(load(&path), Some(*l));
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-
-    #[test]
-    fn missing_or_corrupt_loads_none() {
-        assert_eq!(load(&scratch("definitely-missing")), None);
-        let path = scratch("corrupt");
-        std::fs::write(&path, "{oops").unwrap();
-        assert_eq!(load(&path), None);
-        let _ = std::fs::remove_file(&path);
-        let path = scratch("unknown-code");
-        std::fs::write(&path, "\"xx\"").unwrap();
-        assert_eq!(load(&path), None);
-        let _ = std::fs::remove_file(&path);
     }
 }

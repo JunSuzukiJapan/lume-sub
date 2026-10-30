@@ -16,8 +16,6 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 screencapturekit = "11.1.0"
 cpal = "0.15"
 
-# 環境変数（.envファイル）の読み込み用
-dotenvy = "0.15"
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.34"
 serde_json = "1.0.154"

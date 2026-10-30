@@ -96,16 +96,19 @@ impl HoverState {
     }
 }
 
-/// 移動ストリップ＋リサイズグリップ付きの枠を描く。レイアウトには影響しない
-pub fn paint_frame(ui: &mut egui::Ui, drag_label: &str) {
+/// 移動ストリップ＋リサイズグリップ＋バツ付きの枠を描く。レイアウトには影響しない。
+/// `tag` は複数窓での操作ID衝突を避ける窓名。バツが押されたら true を返す。
+/// もう片方の窓が非表示中など、閉じられないときは `close_enabled` を false にすると
+/// バツがグレーアウトしてクリックを受け付けない
+pub fn paint_frame(ui: &mut egui::Ui, drag_label: &str, tag: &str, close_enabled: bool) -> bool {
     let rect = ui.max_rect();
     let painter = ui.painter();
     let bright = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140);
     let dim = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160);
     painter.rect_stroke(rect.shrink(1.0), 8.0, egui::Stroke::new(1.5_f32, bright));
 
-    // 上部の移動ストリップ
-    let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 20.0));
+    // 上部の移動ストリップ（右上のバツと重ならないよう短くする）
+    let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() - 34.0, 20.0));
     painter.rect_filled(
         strip,
         8.0,
@@ -119,7 +122,11 @@ pub fn paint_frame(ui: &mut egui::Ui, drag_label: &str) {
         dim,
     );
     let move_resp = ui
-        .interact(strip, ui.id().with("overlay-move"), egui::Sense::drag())
+        .interact(
+            strip,
+            ui.id().with(("overlay-move", tag)),
+            egui::Sense::drag(),
+        )
         .on_hover_cursor(egui::CursorIcon::Grab);
     if move_resp.drag_started() {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -137,10 +144,13 @@ pub fn paint_frame(ui: &mut egui::Ui, drag_label: &str) {
             egui::Stroke::new(1.5_f32, bright),
         );
     }
-    let corner =
-        egui::Rect::from_min_size(max - egui::vec2(28.0, 28.0), egui::vec2(28.0, 28.0));
+    let corner = egui::Rect::from_min_size(max - egui::vec2(28.0, 28.0), egui::vec2(28.0, 28.0));
     let resize_resp = ui
-        .interact(corner, ui.id().with("overlay-resize"), egui::Sense::drag())
+        .interact(
+            corner,
+            ui.id().with(("overlay-resize", tag)),
+            egui::Sense::drag(),
+        )
         .on_hover_cursor(egui::CursorIcon::ResizeNwSe);
     if resize_resp.dragged()
         && let Some(size) = ui.ctx().input(|i| i.viewport().inner_rect.map(|r| r.size()))
@@ -150,6 +160,48 @@ pub fn paint_frame(ui: &mut egui::Ui, drag_label: &str) {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::InnerSize(new));
     }
+
+    // 右上のバツ（豆腐回避のため図形で描く）
+    let close_rect = egui::Rect::from_min_size(
+        egui::Pos2::new(rect.max.x - 30.0, rect.min.y + 2.0),
+        egui::vec2(26.0, 20.0),
+    );
+    let clicked = if close_enabled {
+        let close_resp = ui
+            .interact(
+                close_rect,
+                ui.id().with(("overlay-close", tag)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if close_resp.hovered() {
+            painter.rect_filled(
+                close_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(255, 80, 80, 90),
+            );
+        }
+        close_resp.clicked()
+    } else {
+        false
+    };
+    let center = close_rect.center();
+    let r = 5.5;
+    let cross_color = if close_enabled {
+        bright
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45)
+    };
+    let cross = egui::Stroke::new(2.0_f32, cross_color);
+    painter.line_segment(
+        [center + egui::vec2(-r, -r), center + egui::vec2(r, r)],
+        cross,
+    );
+    painter.line_segment(
+        [center + egui::vec2(-r, r), center + egui::vec2(r, -r)],
+        cross,
+    );
+    clicked
 }
 
 #[cfg(test)]
