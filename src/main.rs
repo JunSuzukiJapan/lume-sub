@@ -1,6 +1,7 @@
 mod asr;
 mod audio;
 mod control;
+mod devlog;
 mod fonts;
 mod geometry;
 mod hover;
@@ -20,7 +21,7 @@ use tokio::sync::mpsc;
 use asr::{ASR_MODEL_DEFAULT, AsrConfig, AsrEvent};
 use control::{CaptureState, PipelineController, SpawnContext, buttons_enabled};
 use i18n::{UiLocale, UiStrings};
-use language::{Language, SharedLanguageConfig, SourceLanguage, shared};
+use language::{Language, Script, SharedLanguageConfig, SourceLanguage, shared};
 use screen::DiagLog;
 use store::{ApiConfig, SharedStore, Store};
 use text::shape_for_display;
@@ -99,7 +100,7 @@ fn hide_subtitle(store: &SharedStore, hide_source: bool) {
         (s.show_source(), false)
     };
     if !s.set_shows(source, translation) {
-        println!("⚠️ 両方の字幕を非表示にはできません");
+        dev_log!("⚠️ 両方の字幕を非表示にはできません");
     }
 }
 
@@ -118,7 +119,7 @@ fn follow_window(
     match (outer, screen::active_screen_snapshot()) {
         (Some(outer), Ok(main)) => {
             if let Some(pos) = screen::reconcile_target(main, outer) {
-                println!("🖥️ 追従: 移動します {outer:?} → {pos:?}（メイン画面 {main:?}）");
+                dev_log!("🖥️ 追従: 移動します {outer:?} → {pos:?}（メイン画面 {main:?}）");
                 ctx.send_viewport_cmd_to(target, egui::ViewportCommand::OuterPosition(pos));
             } else {
                 diag.log_if_changed(
@@ -138,10 +139,12 @@ fn follow_window(
 
 /// 字幕1窓分を描く。バツが押されたら true を返す。
 /// もう片方の窓が非表示中のときは `close_enabled` を false にしてバツを無効化する
+#[allow(clippy::too_many_arguments)]
 fn paint_subtitle_window(
     ui: &mut egui::Ui,
     text: &str,
-    shaped_cache: &mut (String, u32, String),
+    shaped_cache: &mut (String, u32, String, String),
+    font: egui::FontId,
     interactive: bool,
     drag_hint: &str,
     tag: &str,
@@ -152,29 +155,28 @@ fn paint_subtitle_window(
         // RTL は論理順のまま実フォント幅で割り、行ごとに整形する（行順保持）
         let max_w = ui.available_width() - 4.0;
         let width_key = (max_w * 2.0).round().max(0.0) as u32;
-        let visual = if shaped_cache.0 == text && shaped_cache.1 == width_key {
-            shaped_cache.2.clone()
-        } else {
-            let shaped = ui.fonts(|fonts| {
-                let measure = |s: &str| {
-                    fonts
-                        .layout_no_wrap(
-                            s.to_owned(),
-                            egui::FontId::proportional(28.0),
-                            egui::Color32::WHITE,
-                        )
-                        .size()
-                        .x
-                };
-                text::shape_paragraph_for_display(text, max_w, &measure).into_owned()
-            });
-            *shaped_cache = (text.to_string(), width_key, shaped.clone());
-            shaped
-        };
+        let font_key = font_cache_key(&font);
+        let visual =
+            if shaped_cache.0 == text && shaped_cache.1 == width_key && shaped_cache.2 == font_key
+            {
+                shaped_cache.3.clone()
+            } else {
+                let shaped = ui.fonts(|fonts| {
+                    let measure = |s: &str| {
+                        fonts
+                            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                    };
+                    text::shape_paragraph_for_display(text, max_w, &measure).into_owned()
+                });
+                *shaped_cache = (text.to_string(), width_key, font_key, shaped.clone());
+                shaped
+            };
         ui.add(
             egui::Label::new(
                 egui::RichText::new(visual)
-                    .font(egui::FontId::proportional(28.0))
+                    .font(font)
                     .color(egui::Color32::WHITE)
                     .strong(),
             )
@@ -185,6 +187,29 @@ fn paint_subtitle_window(
         hover::paint_frame(ui, drag_hint, tag, close_enabled)
     } else {
         false
+    }
+}
+
+/// 整形キャッシュ用の字体キー。字体・サイズが変われば再整形する
+fn font_cache_key(font: &egui::FontId) -> String {
+    let name = match &font.family {
+        egui::FontFamily::Proportional => "p".to_string(),
+        egui::FontFamily::Monospace => "m".to_string(),
+        egui::FontFamily::Name(n) => n.to_string(),
+    };
+    format!("{name}|{}", font.size)
+}
+
+/// フォント選択肢の表示名。空文字＝既定
+fn font_choice_label(loaded: &[(String, String)], id: &str, default_label: &str) -> String {
+    if id.is_empty() {
+        default_label.to_string()
+    } else {
+        loaded
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| id.to_string())
     }
 }
 
@@ -258,6 +283,7 @@ fn main() -> Result<(), eframe::Error> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let store = store::shared(Store::load());
+    devlog::set_enabled(store.lock().expect("store lock poisoned").dev_logs());
     // UI_LANG があれば初回の表示言語に使う（保存後は保存値が優先）
     {
         let mut s = store.lock().expect("store lock poisoned");
@@ -286,7 +312,7 @@ fn main() -> Result<(), eframe::Error> {
             !s.api().api_key.is_empty(),
         )
     };
-    println!(
+    dev_log!(
         "🗝️ API Key: {}",
         if key_saved {
             "保存済み設定を使用"
@@ -296,27 +322,27 @@ fn main() -> Result<(), eframe::Error> {
             "未設定（ASR・翻訳なし）"
         }
     );
-    println!("🌐 API Base URL: {base_url}");
-    println!(
+    dev_log!("🌐 API Base URL: {base_url}");
+    dev_log!(
         "🗣️ 表示言語: {} ({})",
         ui_locale.display_name(),
         ui_locale.code()
     );
-    println!(
+    dev_log!(
         "🖥️ メイン画面追従: {}",
         if follow_main { "ON" } else { "OFF" }
     );
     if saved.is_some() {
-        println!("🪟 字幕位置を復元します");
+        dev_log!("🪟 字幕位置を復元します");
     }
     if saved_control.is_some() {
-        println!("🪟 コントロール位置を復元します");
+        dev_log!("🪟 コントロール位置を復元します");
     }
     // 保存済みキーがなければ初回ダイアログを出す。入力欄には有効値を入れる
     let settings_open = !key_saved;
     let settings_draft = effective;
     let lang_config = store.lock().expect("store lock poisoned").language_config();
-    println!("🈯 言語: {}", lang_config.describe());
+    dev_log!("🈯 言語: {}", lang_config.describe());
     let languages = shared(lang_config);
 
     // 非同期処理（tokio）をマルチスレッドモードで起動
@@ -331,7 +357,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let asr_config = match (api_key, derive_ws_url(&base_url)) {
         (Some(key), Ok(ws_url)) => {
-            println!("🔌 ASR接続先: {ws_url}（model={asr_model}）");
+            dev_log!("🔌 ASR接続先: {ws_url}（model={asr_model}）");
             Some(AsrConfig {
                 ws_url,
                 api_key: key,
@@ -339,11 +365,11 @@ fn main() -> Result<(), eframe::Error> {
             })
         }
         (Some(_), Err(e)) => {
-            println!("⚠️ {e}（ASR・翻訳なし）");
+            dev_log!("⚠️ {e}（ASR・翻訳なし）");
             None
         }
         (None, _) => {
-            println!("⚠️ APIキー未設定のためASR・翻訳は無効です（レベル表示のみ）");
+            dev_log!("⚠️ APIキー未設定のためASR・翻訳は無効です（レベル表示のみ）");
             None
         }
     };
@@ -363,7 +389,7 @@ fn main() -> Result<(), eframe::Error> {
             while let Some(event) = asr_rx.recv().await {
                 match event {
                     AsrEvent::Session(id) => {
-                        println!("✅ ASRセッション開始: {id}");
+                        dev_log!("✅ ASRセッション開始: {id}");
                         let pair = langs
                             .lock()
                             .map(|c| c.describe())
@@ -403,7 +429,7 @@ fn main() -> Result<(), eframe::Error> {
                                     .await
                                 {
                                     Ok(tr) => {
-                                        println!("🌐 途中訳: {tr}");
+                                        dev_log!("🌐 途中訳: {tr}");
                                         partials.note_translated(
                                             text,
                                             tr.clone(),
@@ -413,26 +439,26 @@ fn main() -> Result<(), eframe::Error> {
                                             format!("{tr} …"),
                                         ));
                                     }
-                                    Err(e) => println!("⚠️ 途中翻訳失敗: {e}"),
+                                    Err(e) => dev_log!("⚠️ 途中翻訳失敗: {e}"),
                                 }
                             }
                         }
                     }
                     AsrEvent::Complete { turn_id, transcript } => {
-                        println!("📝 確定#{turn_id}: {transcript}");
+                        dev_log!("📝 確定#{turn_id}: {transcript}");
                         let _ =
                             gui_tx2.try_send(AppEvent::UpdateSource(transcript.clone()));
                         let pair =
                             langs.lock().map(|c| c.clone()).unwrap_or_default();
                         if !pair.needs_translation() {
-                            println!("⏭️ 同一言語のため翻訳スキップ#{turn_id}");
+                            dev_log!("⏭️ 同一言語のため翻訳スキップ#{turn_id}");
                             let _ = gui_tx2
                                 .try_send(AppEvent::UpdateTranslation(transcript.clone()));
                             continue;
                         }
                         // 高速モードの途中訳と一致すれば使い回す
                         if let Some(reuse) = partials.reuse(&transcript) {
-                            println!("⚡ 途中訳を使い回し#{turn_id}");
+                            dev_log!("⚡ 途中訳を使い回し#{turn_id}");
                             session.push_history(transcript.clone(), reuse.clone());
                             let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(reuse));
                             continue;
@@ -450,13 +476,13 @@ fn main() -> Result<(), eframe::Error> {
                             .await
                         {
                             Ok(ja) => {
-                                println!("🌐 翻訳#{turn_id}: {ja}");
+                                dev_log!("🌐 翻訳#{turn_id}: {ja}");
                                 let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(ja));
                             }
-                            Err(e) => println!("⚠️ 翻訳失敗#{turn_id}: {e}"),
+                            Err(e) => dev_log!("⚠️ 翻訳失敗#{turn_id}: {e}"),
                         }
                     }
-                    AsrEvent::Error(e) => println!("⚠️ ASRエラー: {e}"),
+                    AsrEvent::Error(e) => dev_log!("⚠️ ASRエラー: {e}"),
                 }
             }
         });
@@ -510,7 +536,8 @@ fn main() -> Result<(), eframe::Error> {
             visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
             cc.egui_ctx.set_visuals(visuals);
             let font_manager = fonts::FontManager::load();
-            println!("{}", font_manager.report());
+            dev_log!("{}", font_manager.report());
+            let loaded_fonts = font_manager.loaded_styles();
             font_manager.install(&cc.egui_ctx);
             Box::new(LumeSubApp::new(
                 cc.egui_ctx.clone(),
@@ -525,6 +552,7 @@ fn main() -> Result<(), eframe::Error> {
                 control_restored,
                 settings_open,
                 settings_draft,
+                loaded_fonts,
             ))
         }),
     )
@@ -573,9 +601,12 @@ struct LumeSubApp {
     settings_draft: ApiConfig,
     show_source_draft: bool,
     show_translation_draft: bool,
-    /// 整形済み字幕の覚え書き（論理文・幅・視覚文）。変化時のみ再計算する
-    source_cache: (String, u32, String),
-    translation_cache: (String, u32, String),
+    /// 整形済み字幕の覚え書き（論理文・幅・字体・視覚文）。変化時のみ再計算する
+    source_cache: (String, u32, String, String),
+    translation_cache: (String, u32, String, String),
+    /// 読込済みフォントの選択肢（ID・書体名・スクリプト）。言語別に
+    /// 絞り込んで字幕の字体切替に使う
+    loaded_fonts: Vec<(String, String, Script)>,
 }
 
 /// 設定ダイアログでの操作
@@ -601,6 +632,7 @@ impl LumeSubApp {
         control_restored: bool,
         settings_open: bool,
         settings_draft: ApiConfig,
+        loaded_fonts: Vec<(String, String, Script)>,
     ) -> Self {
         let (tx_internal, rx_internal) = mpsc::channel(100);
         let (show_source_draft, show_translation_draft) = {
@@ -635,8 +667,9 @@ impl LumeSubApp {
             settings_draft,
             show_source_draft,
             show_translation_draft,
-            source_cache: (String::new(), u32::MAX, String::new()),
-            translation_cache: (String::new(), u32::MAX, String::new()),
+            source_cache: (String::new(), u32::MAX, String::new(), String::new()),
+            translation_cache: (String::new(), u32::MAX, String::new(), String::new()),
+            loaded_fonts,
         };
 
         let receiver_ctx = ctx.clone();
@@ -706,11 +739,20 @@ impl LumeSubApp {
         };
         let text = &self.translation_text;
         let cache = &mut self.translation_cache;
+        let font = {
+            let s = self.store.lock().expect("store lock poisoned");
+            let choices = fonts::choices_for(
+                &self.loaded_fonts,
+                Some(s.language_config().target.script()),
+            );
+            fonts::subtitle_font_id(s.translation_font(), &choices, s.translation_font_size())
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
             if paint_subtitle_window(
                 ui,
                 text,
                 cache,
+                font.clone(),
                 interactive,
                 &drag_hint,
                 "translation",
@@ -742,10 +784,10 @@ impl LumeSubApp {
         let mut s = self.store.lock().expect("store lock poisoned");
         s.set_api(self.settings_draft.clone());
         if !s.set_shows(self.show_source_draft, self.show_translation_draft) {
-            println!("⚠️ 両方の字幕を非表示にはできません（表示設定は変更しません）");
+            dev_log!("⚠️ 両方の字幕を非表示にはできません（表示設定は変更しません）");
         }
         self.settings_open = false;
-        println!("⚙️ 設定を保存しました（API設定は次回起動から有効）");
+        dev_log!("⚙️ 設定を保存しました（API設定は次回起動から有効）");
     }
 
     /// 設定ダイアログ1フレーム分を描き、操作を返す
@@ -869,7 +911,7 @@ impl LumeSubApp {
                 }
             });
         if current != before {
-            println!(
+            dev_log!(
                 "🗣️ 表示言語: {} ({})",
                 current.display_name(),
                 current.code()
@@ -930,7 +972,7 @@ impl LumeSubApp {
         let mut fast = before;
         ui.checkbox(&mut fast, sh(t.fast_translation));
         if fast != before {
-            println!("🌐 高速翻訳: {}", if fast { "ON" } else { "OFF" });
+            dev_log!("🌐 高速翻訳: {}", if fast { "ON" } else { "OFF" });
             self.store
                 .lock()
                 .expect("store lock poisoned")
@@ -961,6 +1003,122 @@ impl LumeSubApp {
             let mut s = self.store.lock().expect("store lock poisoned");
             s.set_source_tail_chars(source_len);
             s.set_translation_tail_chars(translation_len);
+        }
+        // 開発ログのオン・オフ。変えたら即保存・即反映する
+        let before = self.store.lock().expect("store lock poisoned").dev_logs();
+        let mut dev = before;
+        ui.checkbox(&mut dev, sh(t.dev_logs));
+        if dev != before {
+            self.store
+                .lock()
+                .expect("store lock poisoned")
+                .set_dev_logs(dev);
+            devlog::set_enabled(dev);
+            dev_log!("🛠️ 開発ログ: {}", if dev { "ON" } else { "OFF" });
+        }
+        // 原文の字体。変えたら即保存する
+        let before = self
+            .store
+            .lock()
+            .expect("store lock poisoned")
+            .source_font()
+            .to_string();
+        let mut current = before.clone();
+        // 原文言語の書体に絞る（Auto＝全書体）
+        let source_choices = {
+            let s = self.store.lock().expect("store lock poisoned");
+            fonts::choices_for(
+                &self.loaded_fonts,
+                s.language_config().source.script_filter(),
+            )
+        };
+        egui::ComboBox::from_label(sh(t.source_font))
+            .selected_text(font_choice_label(&source_choices, &current, t.font_default))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut current, String::new(), sh(t.font_default));
+                for (id, label) in &source_choices {
+                    ui.selectable_value(&mut current, id.clone(), label.as_str());
+                }
+            });
+        if current != before {
+            self.store
+                .lock()
+                .expect("store lock poisoned")
+                .set_source_font(current);
+        }
+        // 原文のサイズ。変えたら即保存する
+        let before = self
+            .store
+            .lock()
+            .expect("store lock poisoned")
+            .source_font_size();
+        let mut size = before;
+        ui.horizontal(|ui| {
+            ui.label(sh(t.source_font_size));
+            ui.add(egui::Slider::new(
+                &mut size,
+                fonts::FONT_SIZE_MIN..=fonts::FONT_SIZE_MAX,
+            ));
+        });
+        if size != before {
+            self.store
+                .lock()
+                .expect("store lock poisoned")
+                .set_source_font_size(size);
+        }
+        // 翻訳の字体。変えたら即保存する
+        let before = self
+            .store
+            .lock()
+            .expect("store lock poisoned")
+            .translation_font()
+            .to_string();
+        let mut current = before.clone();
+        // 翻訳言語の書体に絞る
+        let translation_choices = {
+            let s = self.store.lock().expect("store lock poisoned");
+            fonts::choices_for(
+                &self.loaded_fonts,
+                Some(s.language_config().target.script()),
+            )
+        };
+        egui::ComboBox::from_label(sh(t.translation_font))
+            .selected_text(font_choice_label(
+                &translation_choices,
+                &current,
+                t.font_default,
+            ))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut current, String::new(), sh(t.font_default));
+                for (id, label) in &translation_choices {
+                    ui.selectable_value(&mut current, id.clone(), label.as_str());
+                }
+            });
+        if current != before {
+            self.store
+                .lock()
+                .expect("store lock poisoned")
+                .set_translation_font(current);
+        }
+        // 翻訳のサイズ。変えたら即保存する
+        let before = self
+            .store
+            .lock()
+            .expect("store lock poisoned")
+            .translation_font_size();
+        let mut size = before;
+        ui.horizontal(|ui| {
+            ui.label(sh(t.translation_font_size));
+            ui.add(egui::Slider::new(
+                &mut size,
+                fonts::FONT_SIZE_MIN..=fonts::FONT_SIZE_MAX,
+            ));
+        });
+        if size != before {
+            self.store
+                .lock()
+                .expect("store lock poisoned")
+                .set_translation_font_size(size);
         }
         ui.horizontal(|ui| {
             if ui.button(sh(t.settings_button)).clicked() {
@@ -1039,7 +1197,7 @@ impl eframe::App for LumeSubApp {
         if !self.overlay_fullscreen_fixed {
             if screen::ensure_window_over_fullscreen(SOURCE_VIEWPORT_TITLE) {
                 self.overlay_fullscreen_fixed = true;
-                println!("🖥️ 原文窓を常時最前面にしました（全Space＋レベル1000）");
+                dev_log!("🖥️ 原文窓を常時最前面にしました（全Space＋レベル1000）");
             } else {
                 self.follow_diag.log_if_changed(
                     "overlay|missing",
@@ -1073,12 +1231,25 @@ impl eframe::App for LumeSubApp {
                     outer
                 };
                 let flip_h = screen::flip_height();
+                let panel_font_size = self
+                    .store
+                    .lock()
+                    .expect("store lock poisoned")
+                    .source_font_size();
+                let panel_font = self
+                    .store
+                    .lock()
+                    .expect("store lock poisoned")
+                    .source_font()
+                    .to_string();
                 let shown = screen::sync_fullscreen_panel(
                     &mut self.fs_panel,
                     screen::window_occlusion_visible(SOURCE_VIEWPORT_TITLE),
                     mirror,
                     flip_h,
                     &self.source_text,
+                    panel_font_size,
+                    &panel_font,
                     &mut self.panel_diag,
                 );
                 if shown {
@@ -1131,6 +1302,8 @@ impl eframe::App for LumeSubApp {
                 egui::Rect::NOTHING,
                 0.0,
                 "",
+                fonts::DEFAULT_SUBTITLE_SIZE,
+                "",
                 &mut self.panel_diag,
             );
             self.fs_drag.reset();
@@ -1180,11 +1353,20 @@ impl eframe::App for LumeSubApp {
                 .drag_to_move;
             shape_for_display(drag).into_owned()
         };
+        let source_font = {
+            let s = self.store.lock().expect("store lock poisoned");
+            let choices = fonts::choices_for(
+                &self.loaded_fonts,
+                s.language_config().source.script_filter(),
+            );
+            fonts::subtitle_font_id(s.source_font(), &choices, s.source_font_size())
+        };
         egui::CentralPanel::default().show(ctx, |ui| {
             if paint_subtitle_window(
                 ui,
                 &self.source_text,
                 &mut self.source_cache,
+                source_font.clone(),
                 interactive,
                 &drag_hint,
                 "source",
@@ -1287,7 +1469,7 @@ impl eframe::App for LumeSubApp {
             if !self.translation_fullscreen_fixed {
                 if screen::ensure_window_over_fullscreen(TRANSLATION_VIEWPORT_TITLE) {
                     self.translation_fullscreen_fixed = true;
-                    println!("🖥️ 翻訳窓を常時最前面にしました（全Space＋レベル1000）");
+                    dev_log!("🖥️ 翻訳窓を常時最前面にしました（全Space＋レベル1000）");
                 } else {
                     self.follow_diag_translation.log_if_changed(
                         "overlay|missing",
@@ -1309,12 +1491,25 @@ impl eframe::App for LumeSubApp {
                     outer
                 };
                 let flip_h = screen::flip_height();
+                let panel_font_size = self
+                    .store
+                    .lock()
+                    .expect("store lock poisoned")
+                    .translation_font_size();
+                let panel_font = self
+                    .store
+                    .lock()
+                    .expect("store lock poisoned")
+                    .translation_font()
+                    .to_string();
                 let shown = screen::sync_fullscreen_panel(
                     &mut self.fs_panel_translation,
                     screen::window_occlusion_visible(TRANSLATION_VIEWPORT_TITLE),
                     mirror,
                     flip_h,
                     &self.translation_text,
+                    panel_font_size,
+                    &panel_font,
                     &mut self.panel_diag_translation,
                 );
                 if shown {
@@ -1423,6 +1618,8 @@ impl eframe::App for LumeSubApp {
                 egui::Rect::NOTHING,
                 0.0,
                 "",
+                fonts::DEFAULT_SUBTITLE_SIZE,
+                "",
                 &mut self.panel_diag_translation,
             );
             self.fs_drag_translation.reset();
@@ -1488,6 +1685,14 @@ mod tests {
         assert!(p.should_translate("hello", t0));
     }
 
+    #[test]
+    fn font_choice_label_prefers_scripts_name() {
+        let loaded = vec![("jp".to_string(), "Japanese".to_string())];
+        assert_eq!(font_choice_label(&loaded, "", "Default"), "Default");
+        assert_eq!(font_choice_label(&loaded, "jp", "Default"), "Japanese");
+        assert_eq!(font_choice_label(&loaded, "nope", "Default"), "nope");
+    }
+
     fn test_app(handle: Handle) -> LumeSubApp {
         let (gui_tx, gui_rx) = mpsc::channel::<AppEvent>(100);
         let (asr_tx, _asr_rx) = mpsc::channel::<AsrEvent>(100);
@@ -1514,6 +1719,7 @@ mod tests {
             false,
             false,
             ApiConfig::default(),
+            vec![],
         )
     }
 
@@ -1550,7 +1756,7 @@ mod tests {
 
     fn click_close(
         ctx: &egui::Context,
-        cache: &mut (String, u32, String),
+        cache: &mut (String, u32, String, String),
         pos: egui::Pos2,
         enabled: bool,
         pressed: bool,
@@ -1558,7 +1764,16 @@ mod tests {
         let mut clicked = false;
         let _ = ctx.run(click_input(pos, pressed), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                clicked = paint_subtitle_window(ui, "hello", cache, true, "drag", "test", enabled);
+                clicked = paint_subtitle_window(
+                    ui,
+                    "hello",
+                    cache,
+                    egui::FontId::proportional(28.0),
+                    true,
+                    "drag",
+                    "test",
+                    enabled,
+                );
             });
         });
         clicked
@@ -1620,22 +1835,30 @@ mod tests {
     #[test]
     fn subtitle_paint_caches_shaped_text() {
         let ctx = egui::Context::default();
-        let mut cache = (String::new(), u32::MAX, String::new());
+        let mut cache = (String::new(), u32::MAX, String::new(), String::new());
         let mut clicked = true;
         let _ = ctx.run(raw_input_with(vec![]), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                clicked =
-                    paint_subtitle_window(ui, "hello", &mut cache, false, "drag", "test", true);
+                clicked = paint_subtitle_window(
+                    ui,
+                    "hello",
+                    &mut cache,
+                    egui::FontId::proportional(28.0),
+                    false,
+                    "drag",
+                    "test",
+                    true,
+                );
             });
         });
         assert!(!clicked);
         assert_eq!(cache.0, "hello");
-        assert!(!cache.2.is_empty());
+        assert!(!cache.3.is_empty());
     }
 
     fn paint_frame_for_test(
         ctx: &egui::Context,
-        cache: &mut (String, u32, String),
+        cache: &mut (String, u32, String, String),
         enabled: bool,
         locate: Option<&mut egui::Pos2>,
     ) {
@@ -1645,7 +1868,16 @@ mod tests {
                     let rect = ui.max_rect();
                     *out = egui::Pos2::new(rect.max.x - 17.0, rect.min.y + 12.0);
                 }
-                paint_subtitle_window(ui, "hello", cache, true, "drag", "test", enabled);
+                paint_subtitle_window(
+                    ui,
+                    "hello",
+                    cache,
+                    egui::FontId::proportional(28.0),
+                    true,
+                    "drag",
+                    "test",
+                    enabled,
+                );
             });
         });
     }
@@ -1653,7 +1885,7 @@ mod tests {
     #[test]
     fn disabled_close_ignores_clicks() {
         let ctx = egui::Context::default();
-        let mut cache = (String::new(), u32::MAX, String::new());
+        let mut cache = (String::new(), u32::MAX, String::new(), String::new());
         // バツの位置を特定する
         let mut x_center = egui::Pos2::ZERO;
         paint_frame_for_test(&ctx, &mut cache, true, Some(&mut x_center));

@@ -146,6 +146,42 @@ impl Language {
             Vietnamese => "Tiếng Việt",
         }
     }
+
+    /// 字幕フォント選択用のスクリプト分類
+    pub fn script(self) -> Script {
+        use Language::*;
+        match self {
+            Japanese => Script::Japanese,
+            Mandarin => Script::Mandarin,
+            Korean => Script::Korean,
+            Thai => Script::Thai,
+            Arabic => Script::Arabic,
+            Hebrew => Script::Hebrew,
+            Hindi | Marathi => Script::Devanagari,
+            Bengali => Script::Bengali,
+            Tamil => Script::Tamil,
+            Telugu => Script::Telugu,
+            Kannada => Script::Kannada,
+            _ => Script::Latin,
+        }
+    }
+}
+
+/// 書体のスクリプト分類。フォント選択肢の絞り込みに使う
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Script {
+    Latin,
+    Japanese,
+    Mandarin,
+    Korean,
+    Thai,
+    Arabic,
+    Hebrew,
+    Devanagari,
+    Bengali,
+    Tamil,
+    Telugu,
+    Kannada,
 }
 
 impl FromStr for Language {
@@ -172,6 +208,16 @@ pub enum SourceLanguage {
     #[default]
     Auto,
     Specific(Language),
+}
+
+impl SourceLanguage {
+    /// 字体選択の絞り込み条件。Auto＝全書体（None）
+    pub fn script_filter(self) -> Option<Script> {
+        match self {
+            SourceLanguage::Auto => None,
+            SourceLanguage::Specific(l) => Some(l.script()),
+        }
+    }
 }
 
 impl FromStr for SourceLanguage {
@@ -260,6 +306,32 @@ mod tests {
     #[test]
     fn default_is_english() {
         assert_eq!(Language::default(), Language::English);
+    }
+
+    #[test]
+    fn script_groups_languages() {
+        use Language::*;
+        assert_eq!(Japanese.script(), Script::Japanese);
+        assert_eq!(Mandarin.script(), Script::Mandarin);
+        assert_eq!(Hindi.script(), Script::Devanagari);
+        assert_eq!(Marathi.script(), Script::Devanagari);
+        for l in [English, French, Vietnamese, Tagalog] {
+            assert_eq!(l.script(), Script::Latin, "{l:?}");
+        }
+        // 25言語すべて分類できる
+        assert_eq!(Language::all().len(), 25);
+        for l in Language::all() {
+            let _ = l.script();
+        }
+    }
+
+    #[test]
+    fn script_filter_auto_means_all() {
+        assert_eq!(SourceLanguage::Auto.script_filter(), None);
+        assert_eq!(
+            SourceLanguage::Specific(Language::Japanese).script_filter(),
+            Some(Script::Japanese)
+        );
     }
 
     #[test]

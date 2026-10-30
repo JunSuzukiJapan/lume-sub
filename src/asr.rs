@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::audio::{AudioFrame, f32_to_pcm16le_bytes, resample_48k_to_24k};
+use crate::dev_log;
 use crate::language::SharedLanguageConfig;
 
 pub const ASR_MODEL_DEFAULT: &str = "muse-voice-transcribe-1.0";
@@ -211,7 +212,7 @@ pub async fn run_session(
                     match audio_rx.try_recv() {
                         Ok(frame) => {
                             if !format_logged {
-                                println!(
+                                dev_log!(
                                     "🔊 ASR送信開始: {}Hz {}ch → 24kHz PCM16 mono",
                                     frame.sample_rate, frame.channels
                                 );
@@ -255,7 +256,7 @@ pub async fn run_session(
                 }
                 frames_sent += 1;
                 if frames_sent % 375 == 0 {
-                    println!("🔊 ASR送信中: {}フレーム（{}秒相当）", frames_sent, frames_sent * FRAME_MS / 1000);
+                    dev_log!("🔊 ASR送信中: {}フレーム（{}秒相当）", frames_sent, frames_sent * FRAME_MS / 1000);
                 }
             }
         }
@@ -300,12 +301,12 @@ pub async fn supervise(
                 return;
             }
             SessionEnd::ServerClose { code } => {
-                println!("🔌 ASR切断（code={code:?}）、{backoff_secs}秒後に再接続します");
+                dev_log!("🔌 ASR切断（code={code:?}）、{backoff_secs}秒後に再接続します");
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(60);
             }
             SessionEnd::TransportError(e) => {
-                println!("🔌 ASR接続失敗（{e}）、{backoff_secs}秒後に再試行します");
+                dev_log!("🔌 ASR接続失敗（{e}）、{backoff_secs}秒後に再試行します");
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(60);
             }

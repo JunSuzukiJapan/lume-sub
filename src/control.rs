@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::AppEvent;
 use crate::asr::{AsrConfig, AsrEvent, supervise};
 use crate::audio::{AudioFrame, extract_audio_frame, format_audio_status};
+use crate::dev_log;
 use crate::i18n::UiLocale;
 use crate::language::SharedLanguageConfig;
 use crate::store::SharedStore;
@@ -178,7 +179,7 @@ impl PipelineController {
                 if let Some(c) = &inner.capture {
                     c.muted.store(false, Ordering::Relaxed);
                 }
-                println!("▶️ 再開しました");
+                dev_log!("▶️ 再開しました");
             }
             CaptureState::Running => {}
         }
@@ -197,7 +198,7 @@ impl PipelineController {
             c.muted.store(true, Ordering::Relaxed);
         }
         inner.status = CaptureState::Paused;
-        println!("⏸️ 一時停止しました（セッションは維持）");
+        dev_log!("⏸️ 一時停止しました（セッションは維持）");
     }
 
     pub fn stop(&self) {
@@ -240,7 +241,7 @@ fn spawn_session(ctx: &SpawnContext) -> CaptureHandle {
             while rx.recv().await.is_some() {}
         });
     }
-    println!("▶️ キャプチャを開始しました");
+    dev_log!("▶️ キャプチャを開始しました");
     handle
 }
 
@@ -260,7 +261,7 @@ fn spawn_capture(
     };
 
     tokio.spawn(async move {
-        println!("ScreenCaptureKit を初期化中...");
+        dev_log!("ScreenCaptureKit を初期化中...");
 
         // 1. キャプチャ可能な対象のリストを取得
         let content = SCShareableContent::get().expect("コンテンツの一覧取得に失敗");
@@ -301,8 +302,8 @@ fn spawn_capture(
 
         // 6. キャプチャ開始
         match stream.start_capture() {
-            Ok(_) => println!("🚀 ScreenCaptureKit: ストリーム正常に開始！"),
-            Err(e) => println!("❌ ScreenCaptureKit: 起動失敗エラー詳細: {:?}", e),
+            Ok(_) => dev_log!("🚀 ScreenCaptureKit: ストリーム正常に開始！"),
+            Err(e) => dev_log!("❌ ScreenCaptureKit: 起動失敗エラー詳細: {:?}", e),
         }
 
         // Stop 指示まで維持
@@ -311,7 +312,7 @@ fn spawn_capture(
                 cmd = cmd_rx.recv() => {
                     if matches!(cmd, Some(CaptureCmd::Stop) | None) {
                         let _ = stream.stop_capture();
-                        println!("⏹️ キャプチャを終了しました");
+                        dev_log!("⏹️ キャプチャを終了しました");
                         break;
                     }
                 }

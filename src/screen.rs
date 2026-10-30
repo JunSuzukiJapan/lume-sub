@@ -6,6 +6,7 @@
 //! 中央下部へ移す（画面内の微調整とは干渉しない）。
 //! オン・オフは [`crate::store::Store`] で保持・保存する。
 
+use crate::dev_log;
 use crate::geometry;
 
 #[cfg(target_os = "macos")]
@@ -463,6 +464,8 @@ pub struct FullscreenPanel {
     last_frame: (f32, f32, f32, f32),
     last_text: String,
     last_hint: String,
+    last_size: f32,
+    last_font: Option<String>,
     ignores: bool,
     frame_shown: bool,
     close_shown: bool,
@@ -529,7 +532,10 @@ impl FullscreenPanel {
         field.setAlignment(NSTextAlignment(2)); // Center（定数がないため直値）
         // SAFETY: 定数の読み取りのみ
         let bold = unsafe { NSFontWeightBold };
-        field.setFont(Some(&NSFont::systemFontOfSize_weight(28.0, bold)));
+        field.setFont(Some(&NSFont::systemFontOfSize_weight(
+            crate::fonts::DEFAULT_SUBTITLE_SIZE as f64,
+            bold,
+        )));
         field.setTextColor(Some(&NSColor::whiteColor()));
         field.setDrawsBackground(false);
 
@@ -661,6 +667,8 @@ impl FullscreenPanel {
             last_frame: frame,
             last_text: String::new(),
             last_hint: String::new(),
+            last_size: crate::fonts::DEFAULT_SUBTITLE_SIZE,
+            last_font: None,
             ignores: true,
             frame_shown: false,
             close_shown: false,
@@ -668,8 +676,10 @@ impl FullscreenPanel {
     }
 
     /// 枠・文言を同期して前面に出す。変化がなければ順序だけ。
-    /// text は論理順の原文（整形はAppKit任せ。二重整形しないこと）
-    fn show(&mut self, frame: (f32, f32, f32, f32), text: &str) {
+    /// text は論理順の原文（整形はAppKit任せ。二重整形しないこと）。
+    /// font はPostScript名（None＝システムフォント。解決失敗時も同じ）
+    fn show(&mut self, frame: (f32, f32, f32, f32), text: &str, size: f32, font: Option<&str>) {
+        use objc2_app_kit::{NSFont, NSFontWeightBold};
         use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
         if self.last_frame != frame {
@@ -691,6 +701,16 @@ impl FullscreenPanel {
         if self.last_text != text {
             self.field.setStringValue(&NSString::from_str(text));
             self.last_text = text.to_string();
+        }
+        if self.last_font.as_deref() != font || (self.last_size - size).abs() > f32::EPSILON {
+            // SAFETY: 定数の読み取りのみ
+            let bold = unsafe { NSFontWeightBold };
+            let resolved = font
+                .and_then(|name| NSFont::fontWithName_size(&NSString::from_str(name), size as f64))
+                .unwrap_or_else(|| NSFont::systemFontOfSize_weight(size as f64, bold));
+            self.field.setFont(Some(&resolved));
+            self.last_font = font.map(str::to_string);
+            self.last_size = size;
         }
         self.panel.orderFrontRegardless();
     }
@@ -734,12 +754,15 @@ impl FullscreenPanel {
 /// overlay_visible が false（＝他アプリのフルスクリーン中とみなす）のときだけ表示し、
 /// それ以外では隠す。表示切替時のみ診断ログを出す。表示中なら true
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub fn sync_fullscreen_panel(
     slot: &mut Option<FullscreenPanel>,
     overlay_visible: Option<bool>,
     outer: egui::Rect,
     flip_h: f32,
     text: &str,
+    font_size: f32,
+    font_id: &str,
     diag: &mut DiagLog,
 ) -> bool {
     use objc2::MainThreadMarker;
@@ -759,17 +782,21 @@ pub fn sync_fullscreen_panel(
     let frame = panel_frame_for(outer, flip_h);
     let panel = slot.get_or_insert_with(|| FullscreenPanel::new(mtm, frame));
     diag.log_if_changed("panel|shown", &format!("🖥️ パネル字幕: 表示 {frame:?}"));
-    panel.show(frame, text);
+    let font = crate::fonts::panel_postscript(font_id);
+    panel.show(frame, text, font_size, font);
     true
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 pub fn sync_fullscreen_panel(
     _slot: &mut Option<FullscreenPanel>,
     _overlay_visible: Option<bool>,
     _outer: egui::Rect,
     _flip_h: f32,
     _text: &str,
+    _font_size: f32,
+    _font_id: &str,
     _diag: &mut DiagLog,
 ) -> bool {
     unimplemented!("fullscreen overlay control is macOS-only")
@@ -855,7 +882,7 @@ impl DiagLog {
     pub fn log_if_changed(&mut self, key: &str, detail: &str) {
         if self.last_key.as_deref() != Some(key) {
             self.last_key = Some(key.to_string());
-            println!("{detail}");
+            dev_log!("{detail}");
         }
     }
 }
@@ -1181,5 +1208,20 @@ mod tests {
         let main = screen(2560.0, 0.0, 1920.0, 1080.0);
         let landed = egui::Rect::from_min_size(bottom_center_on(main, win()), win());
         assert_eq!(reconcile_target(main, landed), None);
+    }
+
+    /// 対応表のPostScript名が実機で解決できること（macOSのみ）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn panel_postscript_names_resolve_on_macos() {
+        use objc2_app_kit::NSFont;
+        use objc2_foundation::NSString;
+
+        for cand in crate::fonts::FontManager::candidates() {
+            if let Some(name) = crate::fonts::panel_postscript(cand.id) {
+                let resolved = NSFont::fontWithName_size(&NSString::from_str(name), 28.0);
+                assert!(resolved.is_some(), "unresolvable: {} ({})", cand.id, name);
+            }
+        }
     }
 }

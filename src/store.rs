@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::geometry::WindowGeometry;
 use crate::i18n::UiLocale;
+use crate::dev_log;
+use crate::fonts;
 use crate::language::{Language, LanguageConfig, SourceLanguage};
 use crate::text;
 
@@ -39,6 +41,10 @@ fn default_tail_chars() -> usize {
     text::DEFAULT_TAIL_CHARS
 }
 
+fn default_font_size() -> f32 {
+    fonts::DEFAULT_SUBTITLE_SIZE
+}
+
 /// 保存する全項目
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreData {
@@ -56,10 +62,21 @@ pub struct StoreData {
     pub show_translation: bool,
     #[serde(default)]
     pub fast_translation: bool,
+    #[serde(default)]
+    pub dev_logs: bool,
     #[serde(default = "default_tail_chars")]
     pub source_tail_chars: usize,
     #[serde(default = "default_tail_chars")]
     pub translation_tail_chars: usize,
+    /// 原文字体（空文字＝既定チェーン、候補ID＝その字体優先）
+    #[serde(default)]
+    pub source_font: String,
+    #[serde(default = "default_font_size")]
+    pub source_font_size: f32,
+    #[serde(default)]
+    pub translation_font: String,
+    #[serde(default = "default_font_size")]
+    pub translation_font_size: f32,
     #[serde(default)]
     pub ui_locale: UiLocale,
     #[serde(default)]
@@ -78,8 +95,13 @@ impl Default for StoreData {
             show_source: true,
             show_translation: true,
             fast_translation: false,
+            dev_logs: false,
             source_tail_chars: text::DEFAULT_TAIL_CHARS,
             translation_tail_chars: text::DEFAULT_TAIL_CHARS,
+            source_font: String::new(),
+            source_font_size: fonts::DEFAULT_SUBTITLE_SIZE,
+            translation_font: String::new(),
+            translation_font_size: fonts::DEFAULT_SUBTITLE_SIZE,
             ui_locale: UiLocale::default(),
             languages: LanguageConfig::default(),
             api: ApiConfig::default(),
@@ -119,11 +141,11 @@ impl Store {
         let loaded = path.as_deref().and_then(read_file);
         let fresh = loaded.is_none();
         if path.is_none() {
-            println!("⚠️ 保存先が決まらないため設定は保存されません");
+            dev_log!("⚠️ 保存先が決まらないため設定は保存されません");
         }
         let mut data = loaded.unwrap_or_default();
         if !data.show_source && !data.show_translation {
-            println!("⚠️ 両方の字幕が非表示になっていたため表示に戻します");
+            dev_log!("⚠️ 両方の字幕が非表示になっていたため表示に戻します");
             data.show_source = true;
             data.show_translation = true;
         }
@@ -168,12 +190,32 @@ impl Store {
         self.data.fast_translation
     }
 
+    pub fn dev_logs(&self) -> bool {
+        self.data.dev_logs
+    }
+
     pub fn source_tail_chars(&self) -> usize {
         self.data.source_tail_chars
     }
 
     pub fn translation_tail_chars(&self) -> usize {
         self.data.translation_tail_chars
+    }
+
+    pub fn source_font(&self) -> &str {
+        &self.data.source_font
+    }
+
+    pub fn source_font_size(&self) -> f32 {
+        self.data.source_font_size
+    }
+
+    pub fn translation_font(&self) -> &str {
+        &self.data.translation_font
+    }
+
+    pub fn translation_font_size(&self) -> f32 {
+        self.data.translation_font_size
     }
 
     pub fn ui_locale(&self) -> UiLocale {
@@ -200,6 +242,12 @@ impl Store {
         self.save_now();
     }
 
+    /// 開発ログを変えて即保存する
+    pub fn set_dev_logs(&mut self, on: bool) {
+        self.data.dev_logs = on;
+        self.save_now();
+    }
+
     /// 原文の表示文字数を変えて即保存する
     pub fn set_source_tail_chars(&mut self, max: usize) {
         self.data.source_tail_chars = max;
@@ -209,6 +257,30 @@ impl Store {
     /// 翻訳の表示文字数を変えて即保存する
     pub fn set_translation_tail_chars(&mut self, max: usize) {
         self.data.translation_tail_chars = max;
+        self.save_now();
+    }
+
+    /// 原文字体を変えて即保存する
+    pub fn set_source_font(&mut self, id: String) {
+        self.data.source_font = id;
+        self.save_now();
+    }
+
+    /// 原文サイズを変えて即保存する
+    pub fn set_source_font_size(&mut self, size: f32) {
+        self.data.source_font_size = size;
+        self.save_now();
+    }
+
+    /// 翻訳字体を変えて即保存する
+    pub fn set_translation_font(&mut self, id: String) {
+        self.data.translation_font = id;
+        self.save_now();
+    }
+
+    /// 翻訳サイズを変えて即保存する
+    pub fn set_translation_font_size(&mut self, size: f32) {
+        self.data.translation_font_size = size;
         self.save_now();
     }
 
@@ -294,7 +366,7 @@ impl Store {
     fn save_now(&mut self) {
         let Some(path) = &self.path else { return };
         if let Err(e) = write_file(path, &self.data) {
-            println!("⚠️ 設定の保存に失敗: {e}");
+            dev_log!("⚠️ 設定の保存に失敗: {e}");
         }
         self.last_save = Instant::now();
     }
@@ -306,14 +378,14 @@ fn read_file(path: &Path) -> Option<StoreData> {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            println!("⚠️ 設定ファイルを読めません（{}）: {e}", path.display());
+            dev_log!("⚠️ 設定ファイルを読めません（{}）: {e}", path.display());
             return None;
         }
     };
     match serde_json::from_str(&text) {
         Ok(data) => Some(data),
         Err(e) => {
-            println!("⚠️ 設定ファイルが壊れています（{}）: {e}", path.display());
+            dev_log!("⚠️ 設定ファイルが壊れています（{}）: {e}", path.display());
             None
         }
     }
@@ -335,7 +407,7 @@ fn write_file(path: &Path, data: &StoreData) -> std::io::Result<()> {
 fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        println!("⚠️ 設定ファイルの権限変更に失敗: {e}");
+        dev_log!("⚠️ 設定ファイルの権限変更に失敗: {e}");
     }
 }
 
@@ -373,8 +445,13 @@ mod tests {
         assert!(data.show_source);
         assert!(data.show_translation);
         assert!(!data.fast_translation);
+        assert!(!data.dev_logs);
         assert_eq!(data.source_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
         assert_eq!(data.translation_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
+        assert!(data.source_font.is_empty());
+        assert_eq!(data.source_font_size, crate::fonts::DEFAULT_SUBTITLE_SIZE);
+        assert!(data.translation_font.is_empty());
+        assert_eq!(data.translation_font_size, crate::fonts::DEFAULT_SUBTITLE_SIZE);
         assert_eq!(data.ui_locale, UiLocale::English);
         assert_eq!(data.api, ApiConfig::default());
         assert_eq!(data.languages, crate::language::LanguageConfig::default());
@@ -387,8 +464,13 @@ mod tests {
         assert!(data.show_source);
         assert!(data.show_translation);
         assert!(!data.fast_translation);
+        assert!(!data.dev_logs);
         assert_eq!(data.source_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
         assert_eq!(data.translation_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
+        assert!(data.source_font.is_empty());
+        assert_eq!(data.source_font_size, crate::fonts::DEFAULT_SUBTITLE_SIZE);
+        assert!(data.translation_font.is_empty());
+        assert_eq!(data.translation_font_size, crate::fonts::DEFAULT_SUBTITLE_SIZE);
         assert_eq!(data.ui_locale, UiLocale::English);
         assert_eq!(data.languages, crate::language::LanguageConfig::default());
     }
@@ -399,8 +481,13 @@ mod tests {
         let mut store = Store::load_from(Some(path.clone()));
         store.set_follow_main_screen(false);
         store.set_fast_translation(true);
+        store.set_dev_logs(true);
         store.set_source_tail_chars(80);
         store.set_translation_tail_chars(120);
+        store.set_source_font("jp-hiragino".to_string());
+        store.set_source_font_size(32.0);
+        store.set_translation_font("kr-gothic".to_string());
+        store.set_translation_font_size(24.0);
         store.set_ui_locale(UiLocale::Japanese);
         store.set_api(ApiConfig {
             api_key: "key".to_string(),
