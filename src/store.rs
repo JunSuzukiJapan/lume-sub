@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::geometry::WindowGeometry;
 use crate::i18n::UiLocale;
 use crate::language::{Language, LanguageConfig, SourceLanguage};
+use crate::text;
 
 /// 窓位置保存の間引き間隔。ドラッグ中の連続書き込みを抑える
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
@@ -34,6 +35,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_tail_chars() -> usize {
+    text::DEFAULT_TAIL_CHARS
+}
+
 /// 保存する全項目
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreData {
@@ -49,6 +54,12 @@ pub struct StoreData {
     pub show_source: bool,
     #[serde(default = "default_true")]
     pub show_translation: bool,
+    #[serde(default)]
+    pub fast_translation: bool,
+    #[serde(default = "default_tail_chars")]
+    pub source_tail_chars: usize,
+    #[serde(default = "default_tail_chars")]
+    pub translation_tail_chars: usize,
     #[serde(default)]
     pub ui_locale: UiLocale,
     #[serde(default)]
@@ -66,6 +77,9 @@ impl Default for StoreData {
             follow_main_screen: true,
             show_source: true,
             show_translation: true,
+            fast_translation: false,
+            source_tail_chars: text::DEFAULT_TAIL_CHARS,
+            translation_tail_chars: text::DEFAULT_TAIL_CHARS,
             ui_locale: UiLocale::default(),
             languages: LanguageConfig::default(),
             api: ApiConfig::default(),
@@ -150,6 +164,18 @@ impl Store {
         self.data.show_translation
     }
 
+    pub fn fast_translation(&self) -> bool {
+        self.data.fast_translation
+    }
+
+    pub fn source_tail_chars(&self) -> usize {
+        self.data.source_tail_chars
+    }
+
+    pub fn translation_tail_chars(&self) -> usize {
+        self.data.translation_tail_chars
+    }
+
     pub fn ui_locale(&self) -> UiLocale {
         self.data.ui_locale
     }
@@ -165,6 +191,24 @@ impl Store {
     /// 追従設定を変えて即保存する
     pub fn set_follow_main_screen(&mut self, follow: bool) {
         self.data.follow_main_screen = follow;
+        self.save_now();
+    }
+
+    /// 高速翻訳モードを変えて即保存する
+    pub fn set_fast_translation(&mut self, fast: bool) {
+        self.data.fast_translation = fast;
+        self.save_now();
+    }
+
+    /// 原文の表示文字数を変えて即保存する
+    pub fn set_source_tail_chars(&mut self, max: usize) {
+        self.data.source_tail_chars = max;
+        self.save_now();
+    }
+
+    /// 翻訳の表示文字数を変えて即保存する
+    pub fn set_translation_tail_chars(&mut self, max: usize) {
+        self.data.translation_tail_chars = max;
         self.save_now();
     }
 
@@ -328,6 +372,9 @@ mod tests {
         assert!(data.follow_main_screen);
         assert!(data.show_source);
         assert!(data.show_translation);
+        assert!(!data.fast_translation);
+        assert_eq!(data.source_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
+        assert_eq!(data.translation_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
         assert_eq!(data.ui_locale, UiLocale::English);
         assert_eq!(data.api, ApiConfig::default());
         assert_eq!(data.languages, crate::language::LanguageConfig::default());
@@ -339,6 +386,9 @@ mod tests {
         assert!(data.follow_main_screen);
         assert!(data.show_source);
         assert!(data.show_translation);
+        assert!(!data.fast_translation);
+        assert_eq!(data.source_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
+        assert_eq!(data.translation_tail_chars, crate::text::DEFAULT_TAIL_CHARS);
         assert_eq!(data.ui_locale, UiLocale::English);
         assert_eq!(data.languages, crate::language::LanguageConfig::default());
     }
@@ -348,6 +398,9 @@ mod tests {
         let path = scratch("roundtrip");
         let mut store = Store::load_from(Some(path.clone()));
         store.set_follow_main_screen(false);
+        store.set_fast_translation(true);
+        store.set_source_tail_chars(80);
+        store.set_translation_tail_chars(120);
         store.set_ui_locale(UiLocale::Japanese);
         store.set_api(ApiConfig {
             api_key: "key".to_string(),

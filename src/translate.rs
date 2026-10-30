@@ -86,6 +86,31 @@ impl TranslationSession {
         }
     }
 
+    async fn post_chat(
+        client: &Client,
+        base_url: &str,
+        api_key: &str,
+        body: String,
+    ) -> Result<String, String> {
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let resp = client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .bearer_auth(api_key)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("translate request failed: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| format!("translate read failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("translate HTTP {status}: {body}"));
+        }
+        parse_chat_content(&body)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn translate_next(
         &mut self,
         client: &Client,
@@ -96,24 +121,36 @@ impl TranslationSession {
         target: &Language,
         text: &str,
     ) -> Result<String, String> {
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-        let resp = client
-            .post(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .bearer_auth(api_key)
-            .header("Content-Type", "application/json")
-            .body(self.build_request_json(model, source, target, text))
-            .send()
-            .await
-            .map_err(|e| format!("translate request failed: {e}"))?;
-        let status = resp.status();
-        let body = resp.text().await.map_err(|e| format!("translate read failed: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("translate HTTP {status}: {body}"));
-        }
-        let translated = parse_chat_content(&body)?;
+        let translated = Self::post_chat(
+            client,
+            base_url,
+            api_key,
+            self.build_request_json(model, source, target, text),
+        )
+        .await?;
         self.push_history(text.to_string(), translated.clone());
         Ok(translated)
+    }
+
+    /// 途中表示用の翻訳。履歴には積まず、確定時に上書きされる
+    #[allow(clippy::too_many_arguments)]
+    pub async fn translate_preview(
+        &mut self,
+        client: &Client,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        source: &SourceLanguage,
+        target: &Language,
+        text: &str,
+    ) -> Result<String, String> {
+        Self::post_chat(
+            client,
+            base_url,
+            api_key,
+            self.build_request_json(model, source, target, text),
+        )
+        .await
     }
 }
 

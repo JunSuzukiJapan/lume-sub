@@ -13,6 +13,7 @@ mod translate;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
@@ -28,6 +29,60 @@ use translate::{TRANSLATE_MODEL_DEFAULT, TranslationSession};
 pub(crate) enum AppEvent {
     UpdateSource(String),
     UpdateTranslation(String),
+}
+
+/// 高速モードの途中翻訳の間引き間隔。呼び出し回数を抑える
+const PARTIAL_TRANSLATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 高速モードの途中訳の追跡。間引き判定と確定時の使い回しを持つ。
+/// 時刻は引数で受けてテスト可能にする
+struct PartialTracker {
+    last_at: Option<Instant>,
+    last_text: String,
+    last_translation: String,
+}
+
+impl PartialTracker {
+    fn new() -> Self {
+        Self {
+            last_at: None,
+            last_text: String::new(),
+            last_translation: String::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// 文言が変わり、前回から間引き間隔が過ぎたら翻訳する
+    fn should_translate(&self, text: &str, now: Instant) -> bool {
+        if text.is_empty() || text == self.last_text {
+            return false;
+        }
+        match self.last_at {
+            None => true,
+            Some(at) => now >= at + PARTIAL_TRANSLATE_INTERVAL,
+        }
+    }
+
+    fn note_translated(&mut self, text: String, translation: String, now: Instant) {
+        self.last_at = Some(now);
+        self.last_text = text;
+        self.last_translation = translation;
+    }
+
+    /// 確定文が直前の途中訳と一致すれば使い回す。なければ None
+    fn reuse(&self, transcript: &str) -> Option<String> {
+        if !transcript.is_empty()
+            && !self.last_translation.is_empty()
+            && transcript == self.last_text
+        {
+            Some(self.last_translation.clone())
+        } else {
+            None
+        }
+    }
 }
 
 /// 原文窓（ROOT）の窓タイトル。AppKit 照会と共有する
@@ -304,6 +359,7 @@ fn main() -> Result<(), eframe::Error> {
         let model = translate_model.clone();
         rt.spawn(async move {
             let mut session = TranslationSession::default();
+            let mut partials = PartialTracker::new();
             while let Some(event) = asr_rx.recv().await {
                 match event {
                     AsrEvent::Session(id) => {
@@ -321,9 +377,46 @@ fn main() -> Result<(), eframe::Error> {
                         let _ = gui_tx2.try_send(AppEvent::UpdateSource(text));
                         // 新セッションでは古い翻訳を消す
                         let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(String::new()));
+                        partials.reset();
                     }
                     AsrEvent::Partial(text) => {
                         let _ = gui_tx2.try_send(AppEvent::UpdateSource(format!("{text} …")));
+                        // 高速モード：途中文を間引いて翻訳する
+                        let fast = task_store
+                            .lock()
+                            .map(|s| s.fast_translation())
+                            .unwrap_or(false);
+                        if fast && partials.should_translate(&text, Instant::now()) {
+                            let pair =
+                                langs.lock().map(|c| c.clone()).unwrap_or_default();
+                            if pair.needs_translation() {
+                                match session
+                                    .translate_preview(
+                                        &client,
+                                        &base,
+                                        &cfg.api_key,
+                                        &model,
+                                        &pair.source,
+                                        &pair.target,
+                                        &text,
+                                    )
+                                    .await
+                                {
+                                    Ok(tr) => {
+                                        println!("🌐 途中訳: {tr}");
+                                        partials.note_translated(
+                                            text,
+                                            tr.clone(),
+                                            Instant::now(),
+                                        );
+                                        let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(
+                                            format!("{tr} …"),
+                                        ));
+                                    }
+                                    Err(e) => println!("⚠️ 途中翻訳失敗: {e}"),
+                                }
+                            }
+                        }
                     }
                     AsrEvent::Complete { turn_id, transcript } => {
                         println!("📝 確定#{turn_id}: {transcript}");
@@ -335,6 +428,13 @@ fn main() -> Result<(), eframe::Error> {
                             println!("⏭️ 同一言語のため翻訳スキップ#{turn_id}");
                             let _ = gui_tx2
                                 .try_send(AppEvent::UpdateTranslation(transcript.clone()));
+                            continue;
+                        }
+                        // 高速モードの途中訳と一致すれば使い回す
+                        if let Some(reuse) = partials.reuse(&transcript) {
+                            println!("⚡ 途中訳を使い回し#{turn_id}");
+                            session.push_history(transcript.clone(), reuse.clone());
+                            let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(reuse));
                             continue;
                         }
                         match session
@@ -821,6 +921,47 @@ impl LumeSubApp {
                 .expect("store lock poisoned")
                 .set_follow_main_screen(follow);
         }
+        // 高速翻訳のオン・オフ。変えたら即保存する
+        let before = self
+            .store
+            .lock()
+            .expect("store lock poisoned")
+            .fast_translation();
+        let mut fast = before;
+        ui.checkbox(&mut fast, sh(t.fast_translation));
+        if fast != before {
+            println!("🌐 高速翻訳: {}", if fast { "ON" } else { "OFF" });
+            self.store
+                .lock()
+                .expect("store lock poisoned")
+                .set_fast_translation(fast);
+        }
+        // 原文・翻訳の表示文字数。変えたら即保存する（次の字幕から反映）
+        let (before_source, before_translation) = {
+            let s = self.store.lock().expect("store lock poisoned");
+            (s.source_tail_chars(), s.translation_tail_chars())
+        };
+        let mut source_len = before_source;
+        let mut translation_len = before_translation;
+        ui.horizontal(|ui| {
+            ui.label(sh(t.source_length));
+            ui.add(egui::Slider::new(
+                &mut source_len,
+                text::TAIL_CHARS_MIN..=text::TAIL_CHARS_MAX,
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label(sh(t.translation_length));
+            ui.add(egui::Slider::new(
+                &mut translation_len,
+                text::TAIL_CHARS_MIN..=text::TAIL_CHARS_MAX,
+            ));
+        });
+        if source_len != before_source || translation_len != before_translation {
+            let mut s = self.store.lock().expect("store lock poisoned");
+            s.set_source_tail_chars(source_len);
+            s.set_translation_tail_chars(translation_len);
+        }
         ui.horizontal(|ui| {
             if ui.button(sh(t.settings_button)).clicked() {
                 self.open_settings();
@@ -847,13 +988,20 @@ impl LumeSubApp {
 impl eframe::App for LumeSubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Ok(mut rx) = self.receiver.try_lock() {
+            // 累積文は末尾に丸めて表示する（古い文が残り続けないよう）
+            let (source_max, translation_max) = {
+                let s = self.store.lock().expect("store lock poisoned");
+                (s.source_tail_chars(), s.translation_tail_chars())
+            };
             while let Ok(event) = rx.try_recv() {
                 match event {
                     AppEvent::UpdateSource(text) => {
-                        self.source_text = text;
+                        self.source_text =
+                            text::tail_for_display(&text, source_max).to_string();
                     }
                     AppEvent::UpdateTranslation(text) => {
-                        self.translation_text = text;
+                        self.translation_text =
+                            text::tail_for_display(&text, translation_max).to_string();
                     }
                 }
             }
@@ -1316,6 +1464,29 @@ impl eframe::App for LumeSubApp {
 mod tests {
     use super::*;
     use crate::language::LanguageConfig;
+
+    #[test]
+    fn partial_tracker_throttles_and_reuses() {
+        use std::time::Duration;
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        // 初回は空でなければ訳す
+        assert!(p.should_translate("hello", t0));
+        assert!(!p.should_translate("", t0));
+        p.note_translated("hello".into(), "こんにちは".into(), t0);
+        // 同文・間引き内は訳さない
+        assert!(!p.should_translate("hello", t0));
+        assert!(!p.should_translate("hello world", t0));
+        // 変化＋1秒経過で訳す
+        assert!(p.should_translate("hello world", t0 + Duration::from_secs(2)));
+        // 確定一致で使い回す
+        assert_eq!(p.reuse("hello"), Some("こんにちは".to_string()));
+        assert_eq!(p.reuse("other"), None);
+        // リセットで空に戻る
+        p.reset();
+        assert_eq!(p.reuse("hello"), None);
+        assert!(p.should_translate("hello", t0));
+    }
 
     fn test_app(handle: Handle) -> LumeSubApp {
         let (gui_tx, gui_rx) = mpsc::channel::<AppEvent>(100);

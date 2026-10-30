@@ -124,9 +124,110 @@ fn wrap_paragraph(para: &str, max_width: f32, measure: &dyn Fn(&str) -> f32) -> 
     lines.join("\n")
 }
 
+/// 字幕の表示上限の既定（文字数）。認識テキストは累積型のため、
+/// そのまま出すと古い文が残り続ける。上限を超えたら末尾に丸める
+pub const DEFAULT_TAIL_CHARS: usize = 160;
+/// 表示上限の調整範囲（文字数）
+pub const TAIL_CHARS_MIN: usize = 40;
+pub const TAIL_CHARS_MAX: usize = 400;
+/// 丸め後に残す最小文字数。下回る区切りは使わない
+const MIN_TAIL_CHARS: usize = 20;
+
+/// 25言語の文区切り。タイ語など句読点のない言語は文字数切りが担う
+fn is_sentence_end(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '．' | '！' | '？' | '.' | '!' | '?' | '…' | '।' | '؟' | '\n'
+    )
+}
+
+/// 字幕表示用に末尾へ丸める。収まればそのまま借りて返す。
+/// 文区切りを優先し、なければ文字数で切る。
+/// 区切り直後の閉じ括弧・空白は含めない
+pub fn tail_for_display(text: &str, max_chars: usize) -> &str {
+    let max_chars = max_chars.max(1);
+    let total: usize = text.chars().count();
+    if total <= max_chars {
+        return text;
+    }
+    let skip = total - max_chars;
+    let mut start = text.len();
+    for (i, (b, _)) in text.char_indices().enumerate() {
+        if i == skip {
+            start = b;
+            break;
+        }
+    }
+    let mut best = start;
+    for (b, c) in text[start..].char_indices() {
+        if !is_sentence_end(c) {
+            continue;
+        }
+        let mut after = start + b + c.len_utf8();
+        // 閉じ括弧類は区切り側に付ける
+        while let Some(next) = text[after..].chars().next() {
+            if matches!(next, '」' | '』' | '）' | ')' | '"' | '”' | '’') {
+                after += next.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if text[after..].chars().count() >= MIN_TAIL_CHARS {
+            best = after;
+            break;
+        }
+    }
+    let tail = text[best..].trim_start();
+    if tail.is_empty() { &text[start..] } else { tail }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_short_text_unchanged() {
+        assert_eq!(tail_for_display("", DEFAULT_TAIL_CHARS), "");
+        assert_eq!(tail_for_display("こんにちは", DEFAULT_TAIL_CHARS), "こんにちは");
+        let exactly: String = "あ".repeat(DEFAULT_TAIL_CHARS);
+        assert_eq!(tail_for_display(&exactly, DEFAULT_TAIL_CHARS), exactly);
+    }
+
+    #[test]
+    fn tail_snaps_to_sentence_boundary() {
+        let text = format!("{}. {}", "x".repeat(100), "y".repeat(100));
+        assert_eq!(tail_for_display(&text, DEFAULT_TAIL_CHARS), "y".repeat(100));
+    }
+
+    #[test]
+    fn tail_japanese_and_danda() {
+        let ja = format!("{}。{}", "あ".repeat(100), "い".repeat(100));
+        assert_eq!(tail_for_display(&ja, DEFAULT_TAIL_CHARS), "い".repeat(100));
+        let hi = format!("{}।{}", "अ".repeat(100), "आ".repeat(100));
+        assert_eq!(tail_for_display(&hi, DEFAULT_TAIL_CHARS), "आ".repeat(100));
+    }
+
+    #[test]
+    fn tail_short_remainder_uses_hard_cut() {
+        let text = format!("{}.{}", "y".repeat(150), "z".repeat(10));
+        let tail = tail_for_display(&text, DEFAULT_TAIL_CHARS);
+        assert_eq!(tail.chars().count(), DEFAULT_TAIL_CHARS);
+        assert!(tail.starts_with('y'));
+    }
+
+    #[test]
+    fn tail_hard_cut_without_boundary() {
+        let long = "a".repeat(200);
+        let tail = tail_for_display(&long, DEFAULT_TAIL_CHARS);
+        assert_eq!(tail.chars().count(), DEFAULT_TAIL_CHARS);
+    }
+
+    #[test]
+    fn tail_custom_max_is_honored() {
+        let long = "a".repeat(100);
+        assert_eq!(tail_for_display(&long, 40).chars().count(), 40);
+        assert_eq!(tail_for_display("abc", 0).chars().count(), 1);
+    }
 
     #[test]
     fn latin_and_cjk_passthrough() {
