@@ -31,7 +31,7 @@ jobs:
   build-sign-release:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: タグと Cargo.toml のバージョン一致を確認
         if: startsWith(github.ref, 'refs/tags/')
@@ -52,7 +52,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Developer ID 証明書を keychain に導入
-        uses: apple-actions/import-codesign-certs@v3
+        uses: apple-actions/import-codesign-certs@v7
         with:
           p12-file-base64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
           p12-password: ${{ secrets.APPLE_CERT_PASSWORD }}
@@ -66,14 +66,14 @@ jobs:
         run: ./scripts/build-dmg.sh
 
       - name: .dmg を Artifact に保存
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: LumeSub-universal-dmg
           path: dist/*.dmg
 
       - name: GitHub Release を作成
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*.dmg
           generate_release_notes: true
