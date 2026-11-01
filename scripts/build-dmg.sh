@@ -42,7 +42,7 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            echo "error: 不明な引数: $arg（--help を参照）" >&2
+            echo "error: 不明な引数: ${arg}（--help を参照）" >&2
             exit 1
             ;;
     esac
@@ -237,11 +237,11 @@ rm -rf "$STAGE"
 if [[ -n "${APPLE_DEVELOPER_ID:-}" ]]; then
     codesign --force --sign "$APPLE_DEVELOPER_ID" "$DMG"
     if [[ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
-        echo "==> 公証を申請します（profile: $APPLE_KEYCHAIN_PROFILE）"
+        echo "==> 公証を申請します（profile: ${APPLE_KEYCHAIN_PROFILE}）"
         xcrun notarytool submit "$DMG" --keychain-profile "$APPLE_KEYCHAIN_PROFILE" --wait
         xcrun stapler staple "$DMG"
     elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
-        echo "==> 公証を申請します（Apple ID: $APPLE_ID）"
+        echo "==> 公証を申請します（Apple ID: ${APPLE_ID}）"
         xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" --wait
