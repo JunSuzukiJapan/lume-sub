@@ -37,3 +37,6 @@ rustc-ice-*.txt
 
 # macOS特有のゴミファイル
 .DS_Store
+
+# 配布用ビルド成果物（scripts/build-dmg.sh の出力）
+/dist/
