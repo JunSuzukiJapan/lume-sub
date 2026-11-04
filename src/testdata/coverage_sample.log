@@ -1,0 +1,33 @@
+⏱ {"t":0,"ev":"session"}
+⏱ {"t":100,"ev":"speech","state":"start"}
+⏱ {"t":150,"ev":"start","turn":1}
+⏱ {"t":300,"ev":"partial","seq":1,"text":"Hello"}
+⏱ {"t":320,"ev":"trigger","kind":"冒頭","turn":1,"seq":1,"chars":5}
+⏱ {"t":500,"ev":"partial","seq":2,"text":"Hello world"}
+⏱ {"t":900,"ev":"complete","turn":1,"seq":3,"text":"Hello world."}
+⏱ {"t":950,"ev":"xlate","turn":1,"seq":3,"first_ms":50,"total_ms":100,"out":5}
+⏱ {"t":960,"ev":"show","which":"tr","turn":1,"seq":3,"chars":5}
+⏱ {"t":965,"ev":"show","which":"src","turn":1,"seq":3,"chars":12}
+⏱ {"t":2000,"ev":"speech","state":"end"}
+🔍 音声 0.1–2.0s: 認識あり（確定あり・1ターン）
+⏱ {"t":5000,"ev":"speech","state":"start"}
+⏱ {"t":5050,"ev":"start","turn":2}
+⏱ {"t":5300,"ev":"partial","seq":4,"text":"Hola"}
+⏱ {"t":5500,"ev":"xlate_err","turn":2,"seq":4}
+⏱ {"t":5600,"ev":"drop","which":"tr","turn":2,"seq":4}
+⏱ {"t":5900,"ev":"speech","state":"end"}
+⏱ {"t":9000,"ev":"speech","state":"start"}
+⏱ {"t":9050,"ev":"start","turn":3}
+⏱ {"t":9100,"ev":"partial","seq":5,"text":"Same"}
+⏱ {"t":9200,"ev":"complete","turn":3,"seq":6,"text":"Same."}
+⏱ {"t":9210,"ev":"skip","turn":3,"seq":6}
+⏱ {"t":9220,"ev":"show","which":"tr","turn":3,"seq":6,"chars":5}
+⏱ {"t":10000,"ev":"speech","state":"end"}
+⏱ {"t":13000,"ev":"session"}
+⏱ {"t":13100,"ev":"speech","state":"start"}
+⏱ {"t":13150,"ev":"start","turn":1}
+⏱ {"t":13300,"ev":"partial","seq":7,"text":"Bonjour"}
+⏱ {"t":13500,"ev":"complete","turn":1,"seq":8,"text":"Bonjour."}
+⏱ {"t":13600,"ev":"xlate","turn":1,"seq":8,"first_ms":40,"total_ms":90,"out":4}
+⏱ {"t":13610,"ev":"show","which":"tr","turn":1,"seq":8,"chars":4}
+⏱ {"t":14000,"ev":"speech","state":"end"}

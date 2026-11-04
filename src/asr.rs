@@ -7,7 +7,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -33,12 +33,16 @@ pub struct AsrConfig {
 pub enum AsrEvent {
     /// サーバーとハンドシェイク完了（表示用ではなくログ用）
     Session(String),
+    /// 新ターンの発話開始。途中文の区切り・古い文の破棄に使う
+    SpeechStart(i32),
     /// 話し下し中の暫定テキスト（置換表示用）
     Partial(String),
     /// 1ターンの確定テキスト
     Complete { turn_id: i32, transcript: String },
     /// サーバーの error イベント
     Error(String),
+    /// 発話区間の切れ目。true=開始、false=終了。認識との突き合わせ用
+    SpeechActivity { speaking: bool },
 }
 
 /// 1セッションの終了理由
@@ -49,6 +53,101 @@ pub enum SessionEnd {
     ServerClose { code: Option<u16> },
     /// 接続・送受信の失敗
     TransportError(String),
+    /// 音声があるのに認識イベントが来ない停滞（再接続で回復を試みる）
+    Stall { had_progress: bool },
+}
+
+/// 停滞判定の音量下限（≈-35dB）。これ以上の音が続くのに認識がなければ停滞
+const STALL_MIN_RMS: f32 = 0.018;
+/// 停滞とみなす無進展の秒数。通常の初回 partial（約2秒）の2倍。
+/// アラビア語のように認識したりしなかったりする言語の取りこぼしを
+/// 区間内に救うため、短めに検出する
+const STALL_AFTER: Duration = Duration::from_secs(4);
+/// 無音がこの秒数続いたら有音の計数を振り出しに戻す。
+/// 音声供給の瞬断では数え直さないための猶予
+const QUIET_RESET_AFTER: Duration = Duration::from_millis(500);
+
+/// 認識停滞の検知。大きな音が続くのに認識イベントが来なければ再接続する。
+/// ソケットは開いたままサーバーが黙る場合（言語検出の不調など）の表面化と回復用
+struct StallMonitor {
+    loud_since: Option<Instant>,
+    quiet_since: Option<Instant>,
+    last_progress: Instant,
+    max_turn: i32,
+    progressed: bool,
+}
+
+impl StallMonitor {
+    fn new(now: Instant) -> Self {
+        Self {
+            loud_since: None,
+            quiet_since: None,
+            last_progress: now,
+            max_turn: i32::MIN,
+            progressed: false,
+        }
+    }
+
+    /// このセッションで認識進展があったか
+    fn progressed(&self) -> bool {
+        self.progressed
+    }
+
+    /// 音声の到着。停滞したら真（一度出たら次は4秒後）
+    fn note_audio(&mut self, rms: f32, now: Instant) -> bool {
+        if rms < STALL_MIN_RMS {
+            // 短い無音（供給の瞬断）では振り出しに戻さない
+            let quiet = *self.quiet_since.get_or_insert(now);
+            if now.duration_since(quiet) >= QUIET_RESET_AFTER {
+                self.loud_since = None;
+            }
+            return false;
+        }
+        self.quiet_since = None;
+        let since = *self.loud_since.get_or_insert(now);
+        if now.duration_since(since) >= STALL_AFTER
+            && now.duration_since(self.last_progress) >= STALL_AFTER
+        {
+            self.loud_since = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 認識進展の到着
+    fn note_progress(&mut self, now: Instant) {
+        self.last_progress = now;
+        self.loud_since = None;
+        self.progressed = true;
+    }
+
+    /// 暫定文の到着。空文は進展とみなさない
+    fn note_transcript(&mut self, text: &str, now: Instant) {
+        if !text.trim().is_empty() {
+            self.note_progress(now);
+        }
+    }
+
+    /// 発話開始の到着。ターンが進んだときだけ進展とみなす
+    fn note_speech_start(&mut self, turn_id: i32, now: Instant) {
+        if turn_id > self.max_turn {
+            self.max_turn = turn_id;
+            self.note_progress(now);
+        }
+    }
+
+    /// ターン確定の到着。番号を覚えて進展とする
+    fn note_complete(&mut self, turn_id: i32, now: Instant) {
+        self.max_turn = self.max_turn.max(turn_id);
+        self.note_progress(now);
+    }
+}
+
+/// 停滞後の再接続までの待ち秒数。進展のあったセッションの停滞は
+/// 一時的な検出不調とみて短く、無進展のままなら通常のバックオフに委ねる
+fn stall_wait_secs(had_progress: bool, backoff_secs: u64) -> u64 {
+    if had_progress { 1 } else { backoff_secs }
 }
 
 #[derive(Serialize)]
@@ -97,6 +196,48 @@ enum ParsedEvent {
     ServerError(String),
     /// ハンドシェイク応答・audioProgress・speaker・未知タイプ等
     Ignored,
+}
+
+/// 発話区間の検出。音量としきい値＋ハングオーバーで開始・終了を出す。
+/// 記録との突き合わせ用（すべての音声が認識されたかの確認）
+struct SpeechTracker {
+    speaking: bool,
+    quiet_since: Option<Instant>,
+}
+
+/// 終了とみなす無音の継続時間。デモの言語間ギャップ（約0.9秒）より短く、
+/// 文中の息継ぎより長く取る
+const SPEECH_END_AFTER: Duration = Duration::from_millis(800);
+
+impl SpeechTracker {
+    fn new() -> Self {
+        Self {
+            speaking: false,
+            quiet_since: None,
+        }
+    }
+
+    /// 音声の到着。区切りが変わったら Some(true=開始 / false=終了)
+    fn note_audio(&mut self, rms: f32, now: Instant) -> Option<bool> {
+        if rms >= STALL_MIN_RMS {
+            self.quiet_since = None;
+            if !self.speaking {
+                self.speaking = true;
+                return Some(true);
+            }
+            return None;
+        }
+        if !self.speaking {
+            return None;
+        }
+        let quiet = *self.quiet_since.get_or_insert(now);
+        if now.duration_since(quiet) >= SPEECH_END_AFTER {
+            self.speaking = false;
+            self.quiet_since = None;
+            return Some(false);
+        }
+        None
+    }
 }
 
 /// サーバーの JSON テキストフレームを分類する。未知タイプは無視する
@@ -176,6 +317,8 @@ pub async fn run_session(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut frames_sent: u64 = 0;
     let mut format_logged = false;
+    let mut stall = StallMonitor::new(Instant::now());
+    let mut speech = SpeechTracker::new();
 
     loop {
         tokio::select! {
@@ -185,10 +328,15 @@ pub async fn run_session(
                     Some(Ok(Message::Text(t))) => {
                         match parse_server_event(&t.to_string()) {
                             ParsedEvent::Transcript(text) => {
+                                stall.note_transcript(&text, Instant::now());
                                 let _ = event_tx.send(AsrEvent::Partial(text)).await;
                             }
-                            ParsedEvent::SpeechStart(_id) => {}
+                            ParsedEvent::SpeechStart(id) => {
+                                stall.note_speech_start(id, Instant::now());
+                                let _ = event_tx.send(AsrEvent::SpeechStart(id)).await;
+                            }
                             ParsedEvent::SpeechComplete { turn_id, transcript } => {
+                                stall.note_complete(turn_id, Instant::now());
                                 let _ = event_tx.send(AsrEvent::Complete { turn_id, transcript }).await;
                             }
                             ParsedEvent::ServerError(msg) => {
@@ -208,9 +356,11 @@ pub async fn run_session(
             _ = ticker.tick() => {
                 // 手元にある音声を全部取り込む（ブロックしない）
                 let mut input_closed = false;
+                let mut tick_rms = 0.0f32;
                 loop {
                     match audio_rx.try_recv() {
                         Ok(frame) => {
+                            tick_rms = tick_rms.max(frame.rms);
                             if !format_logged {
                                 dev_log!(
                                     "🔊 ASR送信開始: {}Hz {}ch → 24kHz PCM16 mono",
@@ -240,6 +390,20 @@ pub async fn run_session(
                     let _ = sink.send(Message::Text(r#"{"type": "endStream"}"#.into())).await;
                     return drain_until_close(&mut stream).await;
                 }
+                if stall.note_audio(tick_rms, Instant::now()) {
+                    dev_log!(
+                        "⚠️ ASR停滞: 音声あり・無応答{}秒、再接続します",
+                        STALL_AFTER.as_secs()
+                    );
+                    return SessionEnd::Stall {
+                        had_progress: stall.progressed(),
+                    };
+                }
+                // 発話区間の切れ目を知らせる。詰まっていたら捨てる
+                // （助言情報のため。欠けても突き合わせは破綻しない）
+                if let Some(speaking) = speech.note_audio(tick_rms, Instant::now()) {
+                    let _ = event_tx.try_send(AsrEvent::SpeechActivity { speaking });
+                }
                 // 1フレーム送信（足りなければ無音パディング）
                 let mut out = SILENCE_FRAME;
                 let n = pcm_buf.len().min(FRAME_BYTES);
@@ -263,23 +427,32 @@ pub async fn run_session(
     }
 }
 
-/// `endStream` 後にサーバーが閉じるまで受信を続ける
+/// `endStream` 後にサーバーが閉じるまで受信を続ける。
+/// 停止処理中のため、閉じ方によらず再接続しない
 async fn drain_until_close<S>(stream: &mut S) -> SessionEnd
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     while let Some(msg) = stream.next().await {
         match msg {
-            Ok(Message::Close(frame)) => {
-                return SessionEnd::ServerClose {
-                    code: frame.map(|f| f.code.into()),
-                };
-            }
+            Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(_) => break,
         }
     }
     SessionEnd::InputClosed
+}
+
+/// 監視ループの継続判定。停止指示・設定不良のときだけ抜ける。
+/// 送受信中のサーバー切断（1000含む）は再接続する
+fn should_reconnect(end: &SessionEnd) -> bool {
+    match end {
+        SessionEnd::InputClosed => false,
+        SessionEnd::ServerClose { code: Some(1008) } => false,
+        SessionEnd::ServerClose { .. } => true,
+        SessionEnd::TransportError(_) => true,
+        SessionEnd::Stall { .. } => true,
+    }
 }
 
 /// セッションを維持する監督ループ。60分上限・一時的失敗時は再接続する
@@ -291,26 +464,44 @@ pub async fn supervise(
 ) {
     let mut backoff_secs = 2u64;
     loop {
-        match run_session(&mut audio_rx, &event_tx, &cfg, &langs).await {
-            SessionEnd::InputClosed => return,
-            SessionEnd::ServerClose { code: Some(1000) } => return,
-            SessionEnd::ServerClose { code: Some(1008) } => {
+        let end = run_session(&mut audio_rx, &event_tx, &cfg, &langs).await;
+        if !should_reconnect(&end) {
+            if matches!(end, SessionEnd::ServerClose { code: Some(1008) }) {
                 let _ = event_tx
                     .send(AsrEvent::Error("rejected by server (1008): check config/audio".into()))
                     .await;
-                return;
             }
+            return;
+        }
+        match &end {
             SessionEnd::ServerClose { code } => {
+                // 停止指示済みなら再接続しない
+                if audio_rx.is_closed() {
+                    return;
+                }
                 dev_log!("🔌 ASR切断（code={code:?}）、{backoff_secs}秒後に再接続します");
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(60);
             }
             SessionEnd::TransportError(e) => {
+                if audio_rx.is_closed() {
+                    return;
+                }
                 dev_log!("🔌 ASR接続失敗（{e}）、{backoff_secs}秒後に再試行します");
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(60);
             }
+            SessionEnd::Stall { had_progress } => {
+                if audio_rx.is_closed() {
+                    return;
+                }
+                let wait = stall_wait_secs(*had_progress, backoff_secs);
+                dev_log!("🔌 ASR停滞のため、{wait}秒後に再接続します");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
+                continue;
+            }
+            // should_reconnect が偽の場合は上で抜けている
+            SessionEnd::InputClosed => return,
         }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(60);
     }
 }
 
@@ -396,5 +587,167 @@ mod tests {
             parse_server_event(r#"{"type":"error","message":"boom","sessionId":"s"}"#),
             ParsedEvent::ServerError("boom".into())
         );
+    }
+
+    #[tokio::test]
+    async fn drain_reports_stopping_on_any_close() {
+        use futures_util::stream::{self};
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        async fn drain_with(code: CloseCode) -> SessionEnd {
+            let msg = Message::Close(Some(CloseFrame {
+                code,
+                reason: Default::default(),
+            }));
+            let mut s = stream::iter(vec![Ok::<_, tokio_tungstenite::tungstenite::Error>(msg)]);
+            drain_until_close(&mut s).await
+        }
+        // 停止処理中の閉じはコードによらず再接続しない
+        assert!(matches!(
+            drain_with(CloseCode::Normal).await,
+            SessionEnd::InputClosed
+        ));
+        assert!(matches!(
+            drain_with(CloseCode::Error).await,
+            SessionEnd::InputClosed
+        ));
+        // 送受信失敗でも停止扱い
+        let mut s = stream::iter(vec![Err::<Message, _>(
+            tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+        )]);
+        assert!(matches!(
+            drain_until_close(&mut s).await,
+            SessionEnd::InputClosed
+        ));
+    }
+
+    #[test]
+    fn reconnect_decision() {
+        assert!(!should_reconnect(&SessionEnd::InputClosed));
+        assert!(!should_reconnect(&SessionEnd::ServerClose {
+            code: Some(1008)
+        }));
+        // 送受信中の切断は1000でも再接続する
+        assert!(should_reconnect(&SessionEnd::ServerClose {
+            code: Some(1000)
+        }));
+        assert!(should_reconnect(&SessionEnd::ServerClose {
+            code: Some(1011)
+        }));
+        assert!(should_reconnect(&SessionEnd::ServerClose { code: None }));
+        assert!(should_reconnect(&SessionEnd::TransportError("x".into())));
+        assert!(should_reconnect(&SessionEnd::Stall { had_progress: true }));
+        assert!(should_reconnect(&SessionEnd::Stall {
+            had_progress: false
+        }));
+    }
+
+    #[test]
+    fn stall_fires_after_loud_audio_without_progress() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut m = StallMonitor::new(t0);
+        assert!(!m.progressed());
+        // 静音では出ない
+        assert!(!m.note_audio(0.0, at(1)));
+        // 大きな音が続いても4秒未満では出ない
+        assert!(!m.note_audio(0.5, at(5)));
+        assert!(!m.note_audio(0.5, at(8)));
+        // 4秒たったら出る
+        assert!(m.note_audio(0.5, at(9)));
+        // 一度出たらすぐには出ない（次は4秒後）
+        assert!(!m.note_audio(0.5, at(10)));
+        assert!(m.note_audio(0.5, at(14)));
+    }
+
+    #[test]
+    fn stall_resets_on_progress_and_silence() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut m = StallMonitor::new(t0);
+        // 3秒経ってから進展があれば振り出しに戻る
+        assert!(!m.note_audio(0.5, at(0)));
+        m.note_progress(at(3));
+        assert!(m.progressed());
+        assert!(!m.note_audio(0.5, at(6)));
+        assert!(!m.note_audio(0.5, at(9)));
+        assert!(m.note_audio(0.5, at(10)));
+        // 500ms続く静音で振り出しに戻る
+        let mut m = StallMonitor::new(t0);
+        assert!(!m.note_audio(0.5, at(0)));
+        assert!(!m.note_audio(0.0, at(3)));
+        assert!(!m.note_audio(0.0, at(3) + Duration::from_millis(600)));
+        assert!(!m.note_audio(0.5, at(6)));
+        assert!(!m.note_audio(0.5, at(9)));
+        assert!(m.note_audio(0.5, at(10)));
+    }
+
+    #[test]
+    fn stall_tolerates_brief_gaps_in_loud_audio() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut m = StallMonitor::new(t0);
+        // 200msの瞬断を挟んでも計数は続く
+        assert!(!m.note_audio(0.5, at(0)));
+        assert!(!m.note_audio(0.0, at(1000)));
+        assert!(!m.note_audio(0.0, at(1200)));
+        assert!(!m.note_audio(0.5, at(2000)));
+        assert!(m.note_audio(0.5, at(4000)));
+    }
+
+    #[test]
+    fn stall_ignores_unproductive_events() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // 空の暫定文は進展とみなさない
+        let mut m = StallMonitor::new(t0);
+        m.note_transcript("", at(1));
+        m.note_transcript("   ", at(2));
+        assert!(!m.progressed());
+        m.note_transcript("hi", at(3));
+        assert!(m.progressed());
+        // 進まない発話開始は時計を戻さない
+        let mut m = StallMonitor::new(t0);
+        m.note_speech_start(1, at(1));
+        assert!(m.progressed());
+        assert!(!m.note_audio(0.5, at(2)));
+        m.note_speech_start(1, at(3));
+        assert!(m.note_audio(0.5, at(6)));
+        // 確定より古い開始も進展とみなさない
+        let mut m = StallMonitor::new(t0);
+        m.note_complete(2, at(1));
+        m.note_speech_start(2, at(2));
+        assert!(!m.note_audio(0.5, at(2)));
+        assert!(m.note_audio(0.5, at(6)));
+    }
+
+    #[test]
+    fn speech_tracker_marks_utterance_boundaries() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut m = SpeechTracker::new();
+        // 初めの無音では何も出ない
+        assert_eq!(m.note_audio(0.0, at(0)), None);
+        // 有音で開始
+        assert_eq!(m.note_audio(0.5, at(100)), Some(true));
+        assert_eq!(m.note_audio(0.5, at(200)), None);
+        // 短い無音では終わらない
+        assert_eq!(m.note_audio(0.0, at(300)), None);
+        assert_eq!(m.note_audio(0.0, at(900)), None);
+        assert_eq!(m.note_audio(0.5, at(1000)), None);
+        // 800ms続く無音で終了
+        assert_eq!(m.note_audio(0.0, at(2000)), None);
+        assert_eq!(m.note_audio(0.0, at(2800)), Some(false));
+        // 次の有音で再び開始
+        assert_eq!(m.note_audio(0.5, at(3000)), Some(true));
+    }
+
+    #[test]
+    fn stall_waits_short_after_progress() {
+        // 進展のあったセッションの停滞は一時的とみて1秒で繋ぎ直す
+        assert_eq!(stall_wait_secs(true, 2), 1);
+        assert_eq!(stall_wait_secs(true, 16), 1);
+        // 無進展のままなら通常のバックオフに委ねる
+        assert_eq!(stall_wait_secs(false, 2), 2);
+        assert_eq!(stall_wait_secs(false, 16), 16);
     }
 }

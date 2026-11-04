@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,9 +15,6 @@ use crate::dev_log;
 use crate::fonts;
 use crate::language::{Language, LanguageConfig, SourceLanguage};
 use crate::text;
-
-/// 窓位置保存の間引き間隔。ドラッグ中の連続書き込みを抑える
-const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// API設定。空文字は未設定（環境変数・既定値に譲る）
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,17 +105,13 @@ impl Default for StoreData {
     }
 }
 
-/// 前回保存から変わり、間引き間隔が過ぎたら保存すべきか
-fn should_save(last: &Option<WindowGeometry>, current: &WindowGeometry, elapsed: Duration) -> bool {
-    elapsed >= SAVE_INTERVAL && last.is_none_or(|l| l != *current)
-}
-
 /// 全保存処理の窓口。UIスレッドとバックグラウンドタスクで共有する
+///
+/// 窓位置は実行中メモリにだけ追跡し、ファイルへの保存は終了時のみ行う
 pub struct Store {
     path: Option<PathBuf>,
     data: StoreData,
     fresh: bool,
-    last_save: Instant,
 }
 
 impl Store {
@@ -153,7 +145,6 @@ impl Store {
             path,
             data,
             fresh,
-            last_save: Instant::now(),
         }
     }
 
@@ -313,53 +304,50 @@ impl Store {
         true
     }
 
-    /// 原文窓の現在幾何を渡す。変化時のみ間引き保存する
-    pub fn offer_source(&mut self, current: &WindowGeometry) {
-        if should_save(&self.data.source, current, self.last_save.elapsed()) {
-            self.data.source = Some(*current);
-            self.save_now();
-        }
+    /// 原文窓の現在幾何をメモリに覚える。ファイルへの保存は終了時のみ
+    pub fn track_source(&mut self, current: &WindowGeometry) {
+        self.data.source = Some(*current);
     }
 
-    /// 原文窓の幾何を即メモリ反映する。保存は間引く。
-    /// フルスクリーン中のドラッグ用。終了時は [`Store::flush`] で確定する
+    /// 原文窓の幾何をメモリに覚える。フルスクリーン中のドラッグ用。
+    /// ファイルへの保存は終了時のみ
     pub fn set_source_geometry(&mut self, current: WindowGeometry) {
-        let changed = self.data.source.is_none_or(|l| l != current);
         self.data.source = Some(current);
-        if changed && self.last_save.elapsed() >= SAVE_INTERVAL {
-            self.save_now();
-        }
     }
 
-    /// 翻訳窓の幾何を即メモリ反映する。保存は間引く。
-    /// フルスクリーン中のドラッグ用。終了時は [`Store::flush`] で確定する
+    /// 翻訳窓の幾何をメモリに覚える。フルスクリーン中のドラッグ用。
+    /// ファイルへの保存は終了時のみ
     pub fn set_translation_geometry(&mut self, current: WindowGeometry) {
-        let changed = self.data.translation.is_none_or(|l| l != current);
         self.data.translation = Some(current);
-        if changed && self.last_save.elapsed() >= SAVE_INTERVAL {
-            self.save_now();
-        }
     }
 
-    /// 保留中の変更をその場で保存する（ドラッグ終了時）
-    pub fn flush(&mut self) {
+    /// 終了時点の窓位置を確定保存する。None の窓は据え置く
+    pub fn persist_geometries(
+        &mut self,
+        source: Option<WindowGeometry>,
+        translation: Option<WindowGeometry>,
+        control: Option<WindowGeometry>,
+    ) {
+        if let Some(g) = source {
+            self.data.source = Some(g);
+        }
+        if let Some(g) = translation {
+            self.data.translation = Some(g);
+        }
+        if let Some(g) = control {
+            self.data.control = Some(g);
+        }
         self.save_now();
     }
 
-    /// 翻訳窓の現在幾何を渡す。変化時のみ間引き保存する
-    pub fn offer_translation(&mut self, current: &WindowGeometry) {
-        if should_save(&self.data.translation, current, self.last_save.elapsed()) {
-            self.data.translation = Some(*current);
-            self.save_now();
-        }
+    /// 翻訳窓の現在幾何をメモリに覚える。ファイルへの保存は終了時のみ
+    pub fn track_translation(&mut self, current: &WindowGeometry) {
+        self.data.translation = Some(*current);
     }
 
-    /// コントロール窓の現在幾何を渡す。変化時のみ間引き保存する
-    pub fn offer_control(&mut self, current: &WindowGeometry) {
-        if should_save(&self.data.control, current, self.last_save.elapsed()) {
-            self.data.control = Some(*current);
-            self.save_now();
-        }
+    /// コントロール窓の現在幾何をメモリに覚える。ファイルへの保存は終了時のみ
+    pub fn track_control(&mut self, current: &WindowGeometry) {
+        self.data.control = Some(*current);
     }
 
     /// その場で全項目を保存する。パスなしのときは何もしない
@@ -368,7 +356,6 @@ impl Store {
         if let Err(e) = write_file(path, &self.data) {
             dev_log!("⚠️ 設定の保存に失敗: {e}");
         }
-        self.last_save = Instant::now();
     }
 }
 
@@ -517,6 +504,24 @@ mod tests {
     }
 
     #[test]
+    fn exit_geometries_persist_without_throttle() {
+        // 終了時点の窓位置は間引きなしで確定保存する
+        let path = scratch("exit-geoms");
+        let mut store = Store::load_from(Some(path.clone()));
+        let g = sample_geometry();
+        store.persist_geometries(Some(g), Some(g), Some(g));
+        let loaded = Store::load_from(Some(path.clone()));
+        assert_eq!(loaded.source(), Some(g));
+        assert_eq!(loaded.translation(), Some(g));
+        assert_eq!(loaded.control(), Some(g));
+        // None の窓は据え置く
+        store.persist_geometries(None, None, None);
+        let loaded = Store::load_from(Some(path.clone()));
+        assert_eq!(loaded.source(), Some(g));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn cannot_hide_both_subtitles() {
         let path = scratch("shows");
         let mut store = Store::load_from(Some(path.clone()));
@@ -597,33 +602,39 @@ mod tests {
     }
 
     #[test]
-    fn live_geometry_reflects_immediately_and_flushes() {
+    fn live_geometry_reflects_immediately_without_file() {
         let path = scratch("live-geom");
         let mut store = Store::load_from(Some(path.clone()));
         assert_eq!(store.source(), None);
         let g = sample_geometry();
         store.set_source_geometry(g);
-        // 保存間引き中でもメモリには即反映する
+        // メモリには即反映するがファイルは書かない
         assert_eq!(store.source(), Some(g));
-        store.flush();
-        let loaded = Store::load_from(Some(path.clone()));
-        assert_eq!(loaded.source(), Some(g));
+        assert!(!path.exists());
         store.set_translation_geometry(g);
         assert_eq!(store.translation(), Some(g));
-        store.flush();
-        let loaded = Store::load_from(Some(path.clone()));
-        assert_eq!(loaded.translation(), Some(g));
-        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists());
     }
 
     #[test]
-    fn saves_only_on_change_after_interval() {
-        let a = sample_geometry();
-        let b = WindowGeometry { x: 10.0, ..a };
-        assert!(should_save(&None, &a, SAVE_INTERVAL));
-        assert!(!should_save(&None, &a, Duration::ZERO));
-        assert!(!should_save(&Some(a), &a, SAVE_INTERVAL * 10));
-        assert!(should_save(&Some(a), &b, SAVE_INTERVAL));
+    fn geometry_tracking_writes_file_only_on_exit() {
+        let path = scratch("track-geom");
+        let mut store = Store::load_from(Some(path.clone()));
+        let g = sample_geometry();
+        store.track_source(&g);
+        store.track_translation(&g);
+        store.track_control(&g);
+        // メモリには即反映するがファイルは書かない
+        assert_eq!(store.source(), Some(g));
+        assert_eq!(store.translation(), Some(g));
+        assert_eq!(store.control(), Some(g));
+        assert!(!path.exists());
+        // 終了時の確定保存で初めて書く
+        store.persist_geometries(store.source(), store.translation(), store.control());
+        assert!(path.exists());
+        let loaded = Store::load_from(Some(path.clone()));
+        assert_eq!(loaded.source(), Some(g));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

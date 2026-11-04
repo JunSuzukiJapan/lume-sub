@@ -1,0 +1,1 @@
+LumeSub captura el audio del sistema. Lo transcribe al instante con los modelos de Meta. ¡Mira los subtítulos en inglés!

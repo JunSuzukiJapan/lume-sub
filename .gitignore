@@ -40,3 +40,7 @@ rustc-ice-*.txt
 
 # 配布用ビルド成果物（scripts/build-dmg.sh の出力）
 /dist/
+
+# Python venv（demo/ の動画生成用）
+.venv/
+demo/.venv/

@@ -11,10 +11,15 @@ mod screen;
 mod store;
 mod text;
 mod translate;
+mod tune;
 
 use eframe::egui;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
@@ -27,13 +32,461 @@ use store::{ApiConfig, SharedStore, Store};
 use text::shape_for_display;
 use translate::{TRANSLATE_MODEL_DEFAULT, TranslationSession};
 
+/// 字幕1件分の表示要求。古い文の遅延到着を捨てるための順序情報を持つ
+#[derive(Debug, Clone)]
+pub(crate) struct SubtitleUpdate {
+    pub text: String,
+    pub turn: i32,
+    pub seq: u64,
+    pub generation: u64,
+    pub spawned_at: Instant,
+}
+
+impl SubtitleUpdate {
+    pub fn new(text: String, turn: i32, seq: u64, generation: u64) -> Self {
+        Self {
+            text,
+            turn,
+            seq,
+            generation,
+            spawned_at: Instant::now(),
+        }
+    }
+
+    pub fn at(text: String, turn: i32, seq: u64, generation: u64, spawned_at: Instant) -> Self {
+        Self {
+            text,
+            turn,
+            seq,
+            generation,
+            spawned_at,
+        }
+    }
+}
+
+/// 字幕窓ごとの表示ガード。1文ごとにいつ表示したかを覚え、古い文は捨てる
+#[derive(Debug, Clone, Default)]
+struct DisplayGuard {
+    last: Option<(u64, i32, u64, Instant)>,
+}
+
+impl DisplayGuard {
+    fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// 世代切替（言語変更・新セッション）で古い記憶を捨てる
+    fn reset(&mut self, generation: u64) {
+        self.last = Some((generation, i32::MIN, 0, Instant::now()));
+    }
+
+    /// 新しければ真（採用）。古い世代・古いターン・同ターンの古い順序は偽（破棄）。
+    /// ストリーミングの追補（同一トリガーの同順序・新時刻）は受け付ける
+    fn accept(&mut self, update: &SubtitleUpdate) -> bool {
+        if let Some((last_gen, turn, seq, at)) = self.last {
+            if update.generation < last_gen {
+                return false;
+            }
+            if update.generation == last_gen {
+                if update.turn < turn {
+                    return false;
+                }
+                if update.turn == turn
+                    && (update.seq < seq || (update.seq == seq && update.spawned_at < at))
+                {
+                    return false;
+                }
+            }
+        }
+        self.last = Some((
+            update.generation,
+            update.turn,
+            update.seq,
+            update.spawned_at,
+        ));
+        true
+    }
+}
+
+/// 途中翻訳の追補記号。文末にこれが付いていれば未確定の追補、なければ確定文
+const STREAMING_MARKER: char = '…';
+
+/// 追補（未確定）の文言か。送信側は確定文に記号を付けずに送る規約
+fn is_streaming_text(text: &str) -> bool {
+    text.ends_with(STREAMING_MARKER)
+}
+
+/// 追補の表示文。まだ1語もなければ送らない（中身のない "…" を出さない）
+fn progress_text(acc: &str) -> Option<String> {
+    if acc.trim().is_empty() {
+        None
+    } else {
+        Some(format!("{acc} …"))
+    }
+}
+
+/// 翻訳窓の表示バッファ。直近3ターン分を保持する
+///
+/// 新ターンの開始で旧訳を消さず、旧ターンの確定訳が遅れて届いても
+/// 2つ前まで救済する。表示は確定文を優先して2行に選ぶ。
+/// 文の取りこぼしを防ぐための救済つき順序管理
+#[derive(Debug, Clone, Default)]
+struct TranslationTail {
+    old: Option<SubtitleUpdate>,
+    prev: Option<SubtitleUpdate>,
+    cur: Option<SubtitleUpdate>,
+    ledger: SentenceLedger,
+}
+
+impl TranslationTail {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 同一枠内の新旧判定。seq が新しければ採用、同 seq は時刻で判定する
+    fn slot_accept(slot: &Option<SubtitleUpdate>, update: &SubtitleUpdate) -> bool {
+        match slot {
+            None => true,
+            Some(last) => {
+                if update.seq > last.seq {
+                    // 追補は表示文より短くならない範囲でのみ採用する。
+                    // 確定要求など新要求の出始め（短い追補）が古い長い追補を
+                    // 消して「長い→短い→長い」と瞬くのを防ぐ。確定文はつねに採用
+                    !is_streaming_text(&update.text)
+                        || update.text.chars().count() >= last.text.chars().count()
+                } else {
+                    update.seq == last.seq && update.spawned_at >= last.spawned_at
+                }
+            }
+        }
+    }
+
+    /// 順序つき翻訳を受け付ける。採用したら真
+    /// - 新しいターン: 旧枠へずらして採用
+    /// - 現行・前・前々ターン: 新しければ採用（2つ前までの遅延確定の救済）
+    /// - それより古いターン: 破棄
+    fn push(&mut self, update: &SubtitleUpdate) -> bool {
+        if self.ledger.is_new_generation(update.generation) {
+            self.old = None;
+            self.prev = None;
+            self.cur = None;
+        }
+        let accepted = match self.cur.as_ref().map(|u| u.turn) {
+            None => {
+                self.cur = Some(update.clone());
+                true
+            }
+            Some(t) if update.turn > t => {
+                self.old = self.prev.take();
+                self.prev = self.cur.take();
+                self.cur = Some(update.clone());
+                true
+            }
+            Some(t) if update.turn == t => {
+                // 確定文を持つ枠に同じターン番号で別内容の確定文が来たら、
+                // プロバイダが turnId を進めなかった別発話とみなして新枠へ
+                // ずらす（上書きすると前文が寿命前に消える）。確定はターン内
+                // で終端のため、正規の確定→確定の別文置換は存在しない。
+                // 同文の再送は上書き（期限延長）のままにする
+                let (diff_completed, seq_newer) = match self.cur.as_ref() {
+                    Some(cur) => {
+                        let diff = !is_streaming_text(&cur.text)
+                            && !is_streaming_text(&update.text)
+                            && cur.text != update.text;
+                        (diff, update.seq >= cur.seq)
+                    }
+                    None => (false, false),
+                };
+                if diff_completed && seq_newer {
+                    self.old = self.prev.take();
+                    self.prev = self.cur.take();
+                    self.cur = Some(update.clone());
+                    true
+                } else if diff_completed {
+                    false
+                } else if Self::slot_accept(&self.cur, update) {
+                    self.cur = Some(update.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            // 現行より古い。同ターンの枠があれば救済、それ以外は破棄
+            Some(_) => {
+                let prev_turn = self.prev.as_ref().map(|u| u.turn);
+                let old_turn = self.old.as_ref().map(|u| u.turn);
+                if prev_turn.is_none()
+                    || (prev_turn == Some(update.turn)
+                        && Self::slot_accept(&self.prev, update))
+                {
+                    self.prev = Some(update.clone());
+                    true
+                } else if old_turn == Some(update.turn) && Self::slot_accept(&self.old, update) {
+                    self.old = Some(update.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if accepted {
+            self.ledger
+                .note(update.generation, &update.text, update.spawned_at);
+        }
+        accepted
+    }
+
+    /// 枠文に寿命内の文が残っているか
+    fn text_is_fresh(&self, text: &str, now: Instant) -> bool {
+        text::split_sentences(text)
+            .iter()
+            .any(|s| self.ledger.is_fresh(s, now))
+    }
+
+    /// 寿命内・中身ありの枠文を古い順に
+    fn fresh_texts(&self, now: Instant) -> Vec<&str> {
+        [&self.old, &self.prev, &self.cur]
+            .into_iter()
+            .flatten()
+            .map(|u| u.text.as_str())
+            .filter(|t| !t.is_empty())
+            .filter(|t| text::has_words(t))
+            .filter(|t| self.text_is_fresh(t, now))
+            .collect()
+    }
+
+    /// 確定文だけの表示文（上段用）。新しい2枠分。追補は含めない
+    fn render_finalized(&self, now: Instant) -> String {
+        let completed: Vec<&str> = self
+            .fresh_texts(now)
+            .into_iter()
+            .filter(|t| !is_streaming_text(t))
+            .collect();
+        let start = completed.len().saturating_sub(2);
+        self.ledger
+            .filter_fresh(&completed[start..].join("\n"), now)
+    }
+
+    /// 追補の表示文（下段用）。最新枠が追補のときだけ出す
+    fn render_streaming(&self, now: Instant) -> String {
+        match self.fresh_texts(now).last() {
+            Some(t) if is_streaming_text(t) => self.ledger.filter_fresh(t, now),
+            _ => String::new(),
+        }
+    }
+}
+
+/// 言語設定の世代。UIで言語を変えるたびに進み、旧世代の翻訳結果を捨てる
+type SharedGeneration = Arc<AtomicU64>;
+
+/// ASRターンの追跡。開始・確定の到着が前後しても単調に進み、戻らない
+#[derive(Debug, Clone, Default)]
+struct TurnTracker {
+    current: i32,
+}
+
+impl TurnTracker {
+    fn new() -> Self {
+        Self { current: 0 }
+    }
+
+    /// 新ターンの開始。実際に進んだら真（窓の消去はそのときだけ行う）
+    fn note_speech_start(&mut self, turn_id: i32) -> bool {
+        if turn_id > self.current {
+            self.current = turn_id;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// ターン確定。開始が欠けても追いつく。古い確定では戻らない
+    fn note_complete(&mut self, turn_id: i32) {
+        self.current = self.current.max(turn_id);
+    }
+
+    fn current(&self) -> i32 {
+        self.current
+    }
+
+    fn reset(&mut self) {
+        self.current = 0;
+    }
+}
+
+/// ターンごとの観測集計。開発ログに1行サマリを出すための記録。
+/// 表示の可否はGUI側の管轄のため、ここでは要求・完了までを数える
+/// （表示・破棄の突き合わせは --coverage で行う）
+#[derive(Debug, Clone, Default)]
+struct TurnStats {
+    start_at: Option<Instant>,
+    first_partial_at: Option<Instant>,
+    partials: u32,
+    complete: bool,
+    xlate_spawned: u32,
+    xlate_ok: u32,
+    xlate_err: u32,
+}
+
+impl TurnStats {
+    /// 開発ログ用の1行サマリ。在空分は「残」に数える
+    fn summary(&self, turn: i32) -> String {
+        let first = match (self.start_at, self.first_partial_at) {
+            (Some(s), Some(f)) => format!("{}ms", f.duration_since(s).as_millis()),
+            _ => "-".to_string(),
+        };
+        let pending = self
+            .xlate_spawned
+            .saturating_sub(self.xlate_ok + self.xlate_err);
+        format!(
+            "📊 ターン#{turn}: partials={} 初回{} 確定{} 翻訳要求{}(完了{}/失敗{}/残{})",
+            self.partials,
+            first,
+            if self.complete { "あり" } else { "なし" },
+            self.xlate_spawned,
+            self.xlate_ok,
+            self.xlate_err,
+            pending,
+        )
+    }
+}
+
+/// 発話区間の認識見張り。音声区間に対応する認識があったかを残す
+#[derive(Debug, Clone, Default)]
+struct UtteranceWatch {
+    start_ms: u128,
+    recognized: bool,
+    complete: bool,
+    turns: Vec<i32>,
+}
+
+impl UtteranceWatch {
+    fn mark_partial(&mut self, turn: i32) {
+        self.recognized = true;
+        if !self.turns.contains(&turn) {
+            self.turns.push(turn);
+        }
+    }
+
+    fn mark_complete(&mut self, turn: i32) {
+        self.mark_partial(turn);
+        self.complete = true;
+    }
+
+    /// 人間向けの判定行
+    fn verdict(&self, end_ms: u128) -> String {
+        let start = self.start_ms as f64 / 1000.0;
+        let end = end_ms as f64 / 1000.0;
+        if self.recognized {
+            let turns = self
+                .turns
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "🔍 音声 {start:.1}–{end:.1}s: 認識あり (turn={turns} 確定{})",
+                if self.complete { "あり" } else { "なし" },
+            )
+        } else {
+            format!("🔍 音声 {start:.1}–{end:.1}s: 認識なし")
+        }
+    }
+}
+
+/// 集計の吐き出し。upto 未満のターンをサマリ出力して捨てる
+fn flush_turn_stats(map: &mut BTreeMap<i32, TurnStats>, upto: i32) {
+    let old: Vec<i32> = map.keys().copied().filter(|t| *t < upto).collect();
+    for t in old {
+        if let Some(s) = map.remove(&t) {
+            dev_log!("{}", s.summary(t));
+        }
+    }
+}
+
 pub(crate) enum AppEvent {
+    /// 即時表示（待機文・音声状態など順序管理の外）
     UpdateSource(String),
+    /// 順序つき原文。古いターンの遅延は捨てる
+    UpdateSourceSeq(SubtitleUpdate),
+    /// 即時表示（新セッションの消去など）
     UpdateTranslation(String),
+    /// 順序つき翻訳。古い文の遅延は捨てる
+    UpdateTranslationSeq(SubtitleUpdate),
 }
 
 /// 高速モードの途中翻訳の間引き間隔。呼び出し回数を抑える
 const PARTIAL_TRANSLATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// 低速モードの追補翻訳を投げる文字数の伸び
+const PREVIEW_GROWTH_CHARS: usize = 10;
+/// 冒頭訳を投げる最小文字数。1字の断片訳を避ける
+const LEADING_MIN_CHARS: usize = 2;
+/// 文ごとの寿命管理。文の長さに応じた寿命が過ぎた文を落とす。
+/// 世代が変わったら中身を捨てる。原文窓と翻訳窓で共用する
+#[derive(Debug, Clone, Default)]
+struct SentenceLedger {
+    generation: Option<u64>,
+    /// 文とその表示期限。追補で同じ文が来たら期限を延ばす
+    seen: Vec<(String, Instant)>,
+    latest: Option<Instant>,
+}
+
+impl SentenceLedger {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 未見の世代か
+    fn is_new_generation(&self, generation: u64) -> bool {
+        self.generation != Some(generation)
+    }
+
+    /// 文ごとの表示期限を記録する。期限切れの古い文は捨てる
+    fn note(&mut self, generation: u64, text: &str, at: Instant) {
+        if self.is_new_generation(generation) {
+            self.generation = Some(generation);
+            self.seen.clear();
+            self.latest = None;
+        }
+        self.latest = self.latest.max(Some(at));
+        for sent in text::split_sentences(text) {
+            self.seen.retain(|(s, _)| s != sent);
+            self.seen
+                .push((sent.to_string(), at + text::sentence_lifetime(sent)));
+        }
+        if let Some(latest) = self.latest {
+            self.seen.retain(|(_, exp)| *exp > latest);
+        }
+    }
+
+    /// 寿命内か。台帳にない文は掃除済み＝寿命切れのため落とす
+    fn is_fresh(&self, sent: &str, now: Instant) -> bool {
+        match self.seen.iter().find(|(s, _)| s == sent) {
+            Some((_, exp)) => now < *exp,
+            None => false,
+        }
+    }
+
+    /// 寿命切れ・中身なしの文を落とした表示文。1文1行でつなぐ
+    fn filter_fresh(&self, joined: &str, now: Instant) -> String {
+        if joined.is_empty() {
+            return String::new();
+        }
+        text::split_sentences(joined)
+            .into_iter()
+            .filter(|s| text::has_words(s) && self.is_fresh(s, now))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 /// 高速モードの途中訳の追跡。間引き判定と確定時の使い回しを持つ。
 /// 時刻は引数で受けてテスト可能にする
@@ -41,6 +494,27 @@ struct PartialTracker {
     last_at: Option<Instant>,
     last_text: String,
     last_translation: String,
+    /// 翻訳済みテキスト内の文末記号数。ターン確定で0に戻る
+    done_marks: usize,
+    /// 今ターンで途中翻訳を投げたか。ターン確定で false に戻る
+    turn_previewed: bool,
+    /// 前回送信時の文字数。ターン確定で0に戻る
+    spawned_chars: usize,
+}
+
+/// 文末記号の数。`.!?` は直後が空白か末尾のときだけ数える（小数・略語の誤爆避け）
+fn sentence_marks(text: &str) -> usize {
+    let mut count = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let terminal = matches!(c, '。' | '．' | '！' | '？' | '؟' | '।')
+            || matches!(c, '.' | '!' | '?')
+                && chars.peek().is_none_or(|n| n.is_whitespace());
+        if terminal {
+            count += 1;
+        }
+    }
+    count
 }
 
 impl PartialTracker {
@@ -49,6 +523,9 @@ impl PartialTracker {
             last_at: None,
             last_text: String::new(),
             last_translation: String::new(),
+            done_marks: 0,
+            turn_previewed: false,
+            spawned_chars: 0,
         }
     }
 
@@ -68,9 +545,91 @@ impl PartialTracker {
     }
 
     fn note_translated(&mut self, text: String, translation: String, now: Instant) {
+        self.note_spawned(text.clone(), now);
+        self.note_completed(text, translation);
+    }
+
+    /// 翻訳要求の送信時点。間引きはここで効かせ、使い回しは完了まで待つ
+    fn note_spawned(&mut self, text: String, now: Instant) {
         self.last_at = Some(now);
+        self.done_marks = sentence_marks(&text);
+        self.spawned_chars = text.chars().count();
         self.last_text = text;
-        self.last_translation = translation;
+        self.last_translation.clear();
+        self.turn_previewed = true;
+    }
+
+    /// 翻訳結果の到着。最新の送信と一致したときだけ使い回し用に覚える
+    fn note_completed(&mut self, text: String, translation: String) {
+        if text == self.last_text {
+            self.last_translation = translation;
+        }
+    }
+
+    /// 途中文に未翻訳の文末があれば真。モード・間引きによらず即時翻訳する
+    fn sentence_ready(&self, text: &str) -> bool {
+        sentence_marks(text) > self.done_marks
+    }
+
+    /// ターン確定。次ターンの文末カウントを0から始め、冒頭訳に備える
+    fn note_turn_end(&mut self) {
+        self.done_marks = 0;
+        self.turn_previewed = false;
+        self.spawned_chars = 0;
+    }
+
+    /// 今ターンまだ途中翻訳を投げていない文言なら真。3字以上で即訳して
+    /// 翻訳窓の空白を短くする（低速モードでも1回だけ投げる）
+    /// 実動作は [`Self::preview_trigger`] 経由のためテスト専用
+    #[cfg(test)]
+    fn leading_ready(&self, text: &str) -> bool {
+        self.leading_ready_cfg(text, LEADING_MIN_CHARS)
+    }
+
+    /// 閾値指定つきの冒頭判定。記録再生（tune）で閾値を振るときに使う
+    fn leading_ready_cfg(&self, text: &str, leading_min: usize) -> bool {
+        !self.turn_previewed && text.chars().count() >= leading_min
+    }
+
+    /// 前回送信から一定文字数以上増えたら真。句読点のない途中文でも
+    /// 翻訳を止めないための低速モード用
+    /// 実動作は [`Self::preview_trigger`] 経由のためテスト専用
+    #[cfg(test)]
+    fn growth_ready(&self, text: &str) -> bool {
+        self.growth_ready_cfg(text, PREVIEW_GROWTH_CHARS)
+    }
+
+    /// 閾値指定つきの追補判定。記録再生（tune）で閾値を振るときに使う
+    fn growth_ready_cfg(&self, text: &str, growth_chars: usize) -> bool {
+        text != self.last_text
+            && text.chars().count() >= self.spawned_chars.saturating_add(growth_chars)
+    }
+
+    /// 途中翻訳の発火判定。文末→高速間引き→冒頭→低速追補の順
+    fn preview_trigger(&self, text: &str, fast: bool, now: Instant) -> Option<&'static str> {
+        self.preview_trigger_cfg(text, fast, now, PREVIEW_GROWTH_CHARS, LEADING_MIN_CHARS)
+    }
+
+    /// 閾値指定つきの発火判定。記録再生（tune）で閾値を振るときに使う
+    fn preview_trigger_cfg(
+        &self,
+        text: &str,
+        fast: bool,
+        now: Instant,
+        growth_chars: usize,
+        leading_min: usize,
+    ) -> Option<&'static str> {
+        if self.sentence_ready(text) {
+            Some("文末")
+        } else if fast && self.should_translate(text, now) {
+            Some("途中")
+        } else if self.leading_ready_cfg(text, leading_min) {
+            Some("冒頭")
+        } else if !fast && self.growth_ready_cfg(text, growth_chars) {
+            Some("追補")
+        } else {
+            None
+        }
     }
 
     /// 確定文が直前の途中訳と一致すれば使い回す。なければ None
@@ -90,6 +649,15 @@ impl PartialTracker {
 const SOURCE_VIEWPORT_TITLE: &str = "LumeSub";
 /// 翻訳窓の窓タイトル。AppKit 照会と共有する
 const TRANSLATION_VIEWPORT_TITLE: &str = "LumeSub Translation";
+
+/// 終了時の確定保存用に窓幾何を選ぶ。ドラッグ中（実窓が古い）は
+/// None にしてメモリ側のドラッグ値を据え置く
+fn exit_geometry_to_persist(
+    dirty: bool,
+    last: Option<geometry::WindowGeometry>,
+) -> Option<geometry::WindowGeometry> {
+    if dirty { None } else { last }
+}
 
 /// 字幕窓の非表示要求。両方隠しは拒否してログを出す
 fn hide_subtitle(store: &SharedStore, hide_source: bool) {
@@ -137,13 +705,54 @@ fn follow_window(
     }
 }
 
+/// 字幕1区画分の表示指定。翻訳窓は確定（上段）＋追補（下段）の2区画
+struct PaintPart<'a> {
+    text: &'a str,
+    cache: &'a mut (String, u32, String, String),
+    color: egui::Color32,
+    strong: bool,
+}
+
+/// 整形済み字幕1区画を描く
+fn paint_shaped_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    shaped_cache: &mut (String, u32, String, String),
+    font: egui::FontId,
+    color: egui::Color32,
+    strong: bool,
+) {
+    // RTL は論理順のまま実フォント幅で割り、行ごとに整形する（行順保持）
+    let max_w = ui.available_width() - 4.0;
+    let width_key = (max_w * 2.0).round().max(0.0) as u32;
+    let font_key = font_cache_key(&font);
+    let visual =
+        if shaped_cache.0 == text && shaped_cache.1 == width_key && shaped_cache.2 == font_key {
+            shaped_cache.3.clone()
+        } else {
+            let shaped = ui.fonts(|fonts| {
+                let measure = |s: &str| {
+                    fonts
+                        .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                };
+                text::shape_paragraph_for_display(text, max_w, &measure).into_owned()
+            });
+            *shaped_cache = (text.to_string(), width_key, font_key, shaped.clone());
+            shaped
+        };
+    let rich = egui::RichText::new(visual).font(font).color(color);
+    let rich = if strong { rich.strong() } else { rich };
+    ui.add(egui::Label::new(rich).wrap(true));
+}
+
 /// 字幕1窓分を描く。バツが押されたら true を返す。
 /// もう片方の窓が非表示中のときは `close_enabled` を false にしてバツを無効化する
 #[allow(clippy::too_many_arguments)]
 fn paint_subtitle_window(
     ui: &mut egui::Ui,
-    text: &str,
-    shaped_cache: &mut (String, u32, String, String),
+    parts: &mut [PaintPart<'_>],
     font: egui::FontId,
     interactive: bool,
     drag_hint: &str,
@@ -152,36 +761,24 @@ fn paint_subtitle_window(
 ) -> bool {
     ui.vertical_centered(|ui| {
         ui.add_space(20.0);
-        // RTL は論理順のまま実フォント幅で割り、行ごとに整形する（行順保持）
-        let max_w = ui.available_width() - 4.0;
-        let width_key = (max_w * 2.0).round().max(0.0) as u32;
-        let font_key = font_cache_key(&font);
-        let visual =
-            if shaped_cache.0 == text && shaped_cache.1 == width_key && shaped_cache.2 == font_key
-            {
-                shaped_cache.3.clone()
-            } else {
-                let shaped = ui.fonts(|fonts| {
-                    let measure = |s: &str| {
-                        fonts
-                            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
-                            .size()
-                            .x
-                    };
-                    text::shape_paragraph_for_display(text, max_w, &measure).into_owned()
-                });
-                *shaped_cache = (text.to_string(), width_key, font_key, shaped.clone());
-                shaped
-            };
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(visual)
-                    .font(font)
-                    .color(egui::Color32::WHITE)
-                    .strong(),
-            )
-            .wrap(true),
-        );
+        let mut shown = 0;
+        for part in parts.iter_mut() {
+            if part.text.is_empty() {
+                continue;
+            }
+            if shown > 0 {
+                ui.separator();
+            }
+            shown += 1;
+            paint_shaped_text(
+                ui,
+                part.text,
+                part.cache,
+                font.clone(),
+                part.color,
+                part.strong,
+            );
+        }
     });
     if interactive {
         hover::paint_frame(ui, drag_hint, tag, close_enabled)
@@ -278,9 +875,21 @@ fn derive_ws_url(base: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--tune") {
+        tune::run(&args[2..]);
+        return Ok(());
+    }
+    if args.get(1).is_some_and(|a| a == "--coverage") {
+        tune::coverage(&args[2..]);
+        return Ok(());
+    }
     // rustls の暗号プロバイダを明示的に選択する。
     // 依存の features だけでは自動判定できず TLS 初回使用時に panic するため
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 計測ログの時刻原点。パイプラインとUIで共有する
+    let t0 = Instant::now();
 
     let store = store::shared(Store::load());
     devlog::set_enabled(store.lock().expect("store lock poisoned").dev_logs());
@@ -375,7 +984,9 @@ fn main() -> Result<(), eframe::Error> {
     };
     let asr_enabled = asr_config.is_some();
 
-    // ASRイベント → 翻訳 → 字幕（順序保持のため逐次処理）
+    // 言語設定の世代。UIで変えるたびに進む
+    let generation: SharedGeneration = Arc::new(AtomicU64::new(0));
+    // ASRイベント → 字幕は即時、翻訳は並列に投げて遅延到着は捨てる
     if let Some(cfg) = asr_config.clone() {
         let gui_tx2 = gui_tx.clone();
         let client = reqwest::Client::new();
@@ -383,12 +994,43 @@ fn main() -> Result<(), eframe::Error> {
         let task_store = store.clone();
         let base = base_url.clone();
         let model = translate_model.clone();
+        let task_generation = generation.clone();
+        let task_t0 = t0;
         rt.spawn(async move {
-            let mut session = TranslationSession::default();
-            let mut partials = PartialTracker::new();
+            let session = Arc::new(Mutex::new(TranslationSession::default()));
+            let partials = Arc::new(Mutex::new(PartialTracker::new()));
+            let stats = Arc::new(Mutex::new(BTreeMap::<i32, TurnStats>::new()));
+            let mut utterance: Option<UtteranceWatch> = None;
+            let mut turns = TurnTracker::new();
+            let mut next_seq: u64 = 0;
+            let mut local_gen = task_generation.load(Ordering::Relaxed);
             while let Some(event) = asr_rx.recv().await {
+                // 言語が変わったら途中状態を捨てて新世代で始める
+                let cur_gen = task_generation.load(Ordering::Relaxed);
+                if cur_gen != local_gen {
+                    local_gen = cur_gen;
+                    if let Ok(mut p) = partials.lock() {
+                        p.reset();
+                    }
+                    if let Ok(mut s) = session.lock() {
+                        s.reset();
+                    }
+                    if let Ok(mut m) = stats.lock() {
+                        flush_turn_stats(&mut m, i32::MAX);
+                    }
+                    turns.reset();
+                }
                 match event {
                     AsrEvent::Session(id) => {
+                        dev_log!(
+                            "⏱ {}",
+                            serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "session"})
+                        );
+                        // 新セッションはターン番号が振り直されるため世代を進める
+                        local_gen = task_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Ok(mut s) = session.lock() {
+                            s.reset();
+                        }
                         dev_log!("✅ ASRセッション開始: {id}");
                         let pair = langs
                             .lock()
@@ -403,87 +1045,351 @@ fn main() -> Result<(), eframe::Error> {
                         let _ = gui_tx2.try_send(AppEvent::UpdateSource(text));
                         // 新セッションでは古い翻訳を消す
                         let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(String::new()));
-                        partials.reset();
+                        if let Ok(mut p) = partials.lock() {
+                            p.reset();
+                        }
+                        if let Ok(mut m) = stats.lock() {
+                            flush_turn_stats(&mut m, i32::MAX);
+                        }
+                        turns.reset();
+                    }
+                    AsrEvent::SpeechStart(turn_id) => {
+                        dev_log!(
+                            "⏱ {}",
+                            serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "start", "turn": turn_id})
+                        );
+                        // 新しい発話が始まったら旧文を即破棄する。遅延した古い
+                        // 開始では消さない（有効な新文を隠さないため）
+                        if turns.note_speech_start(turn_id) {
+                            dev_log!("🎙️ 発話開始#{turn_id}（旧文を破棄）");
+                            // 新ターンは文末カウントを0から始める
+                            if let Ok(mut p) = partials.lock() {
+                                p.note_turn_end();
+                            }
+                            if let Ok(mut m) = stats.lock() {
+                                flush_turn_stats(&mut m, turn_id);
+                                m.entry(turn_id).or_default().start_at = Some(Instant::now());
+                            }
+                            let seq = next_seq;
+                            next_seq += 1;
+                            let _ = gui_tx2.try_send(AppEvent::UpdateSourceSeq(
+                                SubtitleUpdate::new(String::new(), turn_id, seq, local_gen),
+                            ));
+                            // 翻訳窓は消さない。旧ターンの確定訳が遅れて届いても
+                            // TranslationTail が前ターン枠に救済し、新訳が来るまで旧訳を残す
+                        }
                     }
                     AsrEvent::Partial(text) => {
-                        let _ = gui_tx2.try_send(AppEvent::UpdateSource(format!("{text} …")));
-                        // 高速モード：途中文を間引いて翻訳する
+                        let seq = next_seq;
+                        next_seq += 1;
+                        let turn = turns.current();
+                        dev_log!(
+                            "⏱ {}",
+                            serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "partial", "seq": seq, "text": text})
+                        );
+                        if let Some(u) = utterance.as_mut() {
+                            u.mark_partial(turn);
+                        }
+                        if let Ok(mut m) = stats.lock() {
+                            let entry = m.entry(turn).or_default();
+                            entry.partials += 1;
+                            if entry.first_partial_at.is_none() {
+                                entry.first_partial_at = Some(Instant::now());
+                            }
+                        }
+                        let _ = gui_tx2.try_send(AppEvent::UpdateSourceSeq(
+                            SubtitleUpdate::new(format!("{text} …"), turn, seq, local_gen),
+                        ));
+                        // 文末が出たら両モードで即時翻訳。高速モードは文の途中も間引いて訳す。
+                        // 低速モードは冒頭1回＋文字数の伸びで追補する
                         let fast = task_store
                             .lock()
                             .map(|s| s.fast_translation())
                             .unwrap_or(false);
-                        if fast && partials.should_translate(&text, Instant::now()) {
+                        let trigger = partials
+                            .lock()
+                            .map(|p| p.preview_trigger(&text, fast, Instant::now()));
+                        let trigger = trigger.unwrap_or(None);
+                        if let Some(kind) = trigger {
+                            dev_log!(
+                                "⏱ {}",
+                                serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "trigger", "kind": kind, "turn": turn, "seq": seq, "chars": text.chars().count()})
+                            );
                             let pair =
                                 langs.lock().map(|c| c.clone()).unwrap_or_default();
                             if pair.needs_translation() {
-                                match session
-                                    .translate_preview(
-                                        &client,
-                                        &base,
-                                        &cfg.api_key,
+                                let body = session.lock().ok().map(|mut s| {
+                                    s.build_request_json(
                                         &model,
                                         &pair.source,
                                         &pair.target,
                                         &text,
                                     )
-                                    .await
-                                {
-                                    Ok(tr) => {
-                                        dev_log!("🌐 途中訳: {tr}");
-                                        partials.note_translated(
-                                            text,
-                                            tr.clone(),
-                                            Instant::now(),
-                                        );
-                                        let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(
-                                            format!("{tr} …"),
-                                        ));
+                                });
+                                if let Some(body) = body {
+                                    if let Ok(mut p) = partials.lock() {
+                                        p.note_spawned(text.clone(), Instant::now());
                                     }
-                                    Err(e) => dev_log!("⚠️ 途中翻訳失敗: {e}"),
+                                    if let Ok(mut m) = stats.lock() {
+                                        m.entry(turn).or_default().xlate_spawned += 1;
+                                    }
+                                    let task_client = client.clone();
+                                    let task_base = base.clone();
+                                    let task_key = cfg.api_key.clone();
+                                    let task_gui = gui_tx2.clone();
+                                    let task_partials = partials.clone();
+                                    let task_stats = stats.clone();
+                                    let task_gen = task_generation.clone();
+                                    let kind = kind.to_string();
+                                    tokio::spawn(async move {
+                                        let progress_gui = task_gui.clone();
+                                        let progress_gen = task_gen.clone();
+                                        let req_start = Instant::now();
+                                        let mut first_ms: Option<u128> = None;
+                                        match TranslationSession::post_chat_stream(
+                                            &task_client,
+                                            &task_base,
+                                            &task_key,
+                                            body,
+                                            |acc, _final| {
+                                                if first_ms.is_none() {
+                                                    first_ms =
+                                                        Some(req_start.elapsed().as_millis());
+                                                }
+                                                // 旧世代の追補は捨てる
+                                                if progress_gen.load(Ordering::Relaxed) != local_gen
+                                                {
+                                                    return;
+                                                }
+                                                if let Some(text) = progress_text(acc) {
+                                                    let _ = progress_gui.try_send(
+                                                        AppEvent::UpdateTranslationSeq(
+                                                            SubtitleUpdate::at(
+                                                                text,
+                                                                turn,
+                                                                seq,
+                                                                local_gen,
+                                                                Instant::now(),
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(tr) => {
+                                                dev_log!(
+                                                    "⏱ {}",
+                                                    serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "xlate", "turn": turn, "seq": seq, "first_ms": first_ms.unwrap_or(req_start.elapsed().as_millis()), "total_ms": req_start.elapsed().as_millis(), "out": tr.chars().count()})
+                                                );
+                                                // 旧世代の結果は捨てる
+                                                if task_gen.load(Ordering::Relaxed) != local_gen {
+                                                    return;
+                                                }
+                                                dev_log!("🌐 {kind}訳: {tr}");
+                                                if let Ok(mut p) = task_partials.lock() {
+                                                    p.note_completed(text, tr.clone());
+                                                }
+                                                if let Ok(mut m) = task_stats.lock()
+                                                    && let Some(s) = m.get_mut(&turn)
+                                                {
+                                                    s.xlate_ok += 1;
+                                                }
+                                                // 最終文は追補で表示済みのため送らない
+                                            }
+                                            Err(e) => {
+                                                dev_log!(
+                                                    "⏱ {}",
+                                                    serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "xlate_err", "turn": turn, "seq": seq})
+                                                );
+                                                dev_log!("⚠️ 途中翻訳失敗: {e}");
+                                                if let Ok(mut m) = task_stats.lock()
+                                                    && let Some(s) = m.get_mut(&turn)
+                                                {
+                                                    s.xlate_err += 1;
+                                                }
+                                            }
+                                        }
+                                    });
                                 }
                             }
                         }
                     }
                     AsrEvent::Complete { turn_id, transcript } => {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        dev_log!(
+                            "⏱ {}",
+                            serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "complete", "turn": turn_id, "seq": seq, "text": transcript})
+                        );
                         dev_log!("📝 確定#{turn_id}: {transcript}");
-                        let _ =
-                            gui_tx2.try_send(AppEvent::UpdateSource(transcript.clone()));
+                        if let Some(u) = utterance.as_mut() {
+                            u.mark_complete(turn_id);
+                        }
+                        let _ = gui_tx2.try_send(AppEvent::UpdateSourceSeq(
+                            SubtitleUpdate::new(transcript.clone(), turn_id, seq, local_gen),
+                        ));
                         let pair =
                             langs.lock().map(|c| c.clone()).unwrap_or_default();
+                        // 使い回し判定はターン終了記録より先に行う。
+                        // 重なりで古い確定が遅れてきたときは新ターンの数を消さない
+                        let reused =
+                            partials.lock().ok().and_then(|p| p.reuse(&transcript));
+                        if let Ok(mut m) = stats.lock() {
+                            m.entry(turn_id).or_default().complete = true;
+                        }
+                        turns.note_complete(turn_id);
+                        if turn_id == turns.current()
+                            && let Ok(mut p) = partials.lock()
+                        {
+                            p.note_turn_end();
+                        }
                         if !pair.needs_translation() {
                             dev_log!("⏭️ 同一言語のため翻訳スキップ#{turn_id}");
-                            let _ = gui_tx2
-                                .try_send(AppEvent::UpdateTranslation(transcript.clone()));
+                            dev_log!(
+                                "⏱ {}",
+                                serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "skip", "turn": turn_id, "seq": seq})
+                            );
+                            let _ = gui_tx2.try_send(AppEvent::UpdateTranslationSeq(
+                                SubtitleUpdate::new(transcript.clone(), turn_id, seq, local_gen),
+                            ));
                             continue;
                         }
                         // 高速モードの途中訳と一致すれば使い回す
-                        if let Some(reuse) = partials.reuse(&transcript) {
+                        if let Some(reuse) = reused {
                             dev_log!("⚡ 途中訳を使い回し#{turn_id}");
-                            session.push_history(transcript.clone(), reuse.clone());
-                            let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(reuse));
+                            if let Ok(mut s) = session.lock() {
+                                s.push_history(transcript.clone(), reuse.clone());
+                            }
+                            let _ = gui_tx2.try_send(AppEvent::UpdateTranslationSeq(
+                                SubtitleUpdate::new(reuse, turn_id, seq, local_gen),
+                            ));
                             continue;
                         }
-                        match session
-                            .translate_next(
-                                &client,
-                                &base,
-                                &cfg.api_key,
+                        let body = session.lock().ok().map(|mut s| {
+                            s.build_request_json(
                                 &model,
                                 &pair.source,
                                 &pair.target,
                                 &transcript,
                             )
-                            .await
-                        {
-                            Ok(ja) => {
-                                dev_log!("🌐 翻訳#{turn_id}: {ja}");
-                                let _ = gui_tx2.try_send(AppEvent::UpdateTranslation(ja));
+                        });
+                        if let Some(body) = body {
+                            if let Ok(mut m) = stats.lock() {
+                                m.entry(turn_id).or_default().xlate_spawned += 1;
                             }
-                            Err(e) => dev_log!("⚠️ 翻訳失敗#{turn_id}: {e}"),
+                            let task_client = client.clone();
+                            let task_base = base.clone();
+                            let task_key = cfg.api_key.clone();
+                            let task_gui = gui_tx2.clone();
+                            let task_session = session.clone();
+                            let task_stats = stats.clone();
+                            let task_gen = task_generation.clone();
+                            tokio::spawn(async move {
+                                let progress_gui = task_gui.clone();
+                                let progress_gen = task_gen.clone();
+                                let req_start = Instant::now();
+                                let mut first_ms: Option<u128> = None;
+                                match TranslationSession::post_chat_stream(
+                                    &task_client,
+                                    &task_base,
+                                    &task_key,
+                                    body,
+                                    |acc, is_final| {
+                                        if first_ms.is_none() {
+                                            first_ms = Some(req_start.elapsed().as_millis());
+                                        }
+                                        // 旧世代の追補は捨てる。最終文は呼び出し元で送る
+                                        if is_final
+                                            || progress_gen.load(Ordering::Relaxed) != local_gen
+                                        {
+                                            return;
+                                        }
+                                        if let Some(text) = progress_text(acc) {
+                                            let _ = progress_gui.try_send(
+                                                AppEvent::UpdateTranslationSeq(
+                                                    SubtitleUpdate::at(
+                                                        text,
+                                                        turn_id,
+                                                        seq,
+                                                        local_gen,
+                                                        Instant::now(),
+                                                    ),
+                                                ),
+                                            );
+                                        }
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(translated) => {
+                                        dev_log!(
+                                            "⏱ {}",
+                                            serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "xlate", "turn": turn_id, "seq": seq, "first_ms": first_ms.unwrap_or(req_start.elapsed().as_millis()), "total_ms": req_start.elapsed().as_millis(), "out": translated.chars().count()})
+                                        );
+                                        if task_gen.load(Ordering::Relaxed) != local_gen {
+                                            return;
+                                        }
+                                        dev_log!("🌐 翻訳#{turn_id}: {translated}");
+                                        if let Ok(mut s) = task_session.lock() {
+                                            s.push_history(transcript, translated.clone());
+                                        }
+                                        if let Ok(mut m) = task_stats.lock()
+                                            && let Some(s) = m.get_mut(&turn_id)
+                                        {
+                                            s.xlate_ok += 1;
+                                        }
+                                        let _ = task_gui.try_send(
+                                            AppEvent::UpdateTranslationSeq(SubtitleUpdate::at(
+                                                translated,
+                                                turn_id,
+                                                seq,
+                                                local_gen,
+                                                Instant::now(),
+                                            )),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        dev_log!(
+                                            "⏱ {}",
+                                            serde_json::json!({"t": task_t0.elapsed().as_millis(), "ev": "xlate_err", "turn": turn_id, "seq": seq})
+                                        );
+                                        dev_log!("⚠️ 翻訳失敗#{turn_id}: {e}");
+                                        if let Ok(mut m) = task_stats.lock()
+                                            && let Some(s) = m.get_mut(&turn_id)
+                                        {
+                                            s.xlate_err += 1;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    AsrEvent::SpeechActivity { speaking } => {
+                        let now_ms = task_t0.elapsed().as_millis();
+                        dev_log!(
+                            "⏱ {}",
+                            serde_json::json!({"t": now_ms, "ev": "speech", "state": if speaking { "start" } else { "end" }})
+                        );
+                        if speaking {
+                            // 閉じ忘れ（再接続またぎ）はここで区切る
+                            if let Some(prev) = utterance.take() {
+                                dev_log!("{}", prev.verdict(now_ms));
+                            }
+                            utterance = Some(UtteranceWatch {
+                                start_ms: now_ms,
+                                ..Default::default()
+                            });
+                        } else if let Some(done) = utterance.take() {
+                            dev_log!("{}", done.verdict(now_ms));
                         }
                     }
                     AsrEvent::Error(e) => dev_log!("⚠️ ASRエラー: {e}"),
                 }
+            }
+            if let Ok(mut m) = stats.lock() {
+                flush_turn_stats(&mut m, i32::MAX);
             }
         });
     }
@@ -546,6 +1452,7 @@ fn main() -> Result<(), eframe::Error> {
                 initial_text,
                 controller,
                 languages,
+                generation.clone(),
                 store.clone(),
                 restored,
                 saved_control,
@@ -553,6 +1460,7 @@ fn main() -> Result<(), eframe::Error> {
                 settings_open,
                 settings_draft,
                 loaded_fonts,
+                t0,
             ))
         }),
     )
@@ -575,10 +1483,19 @@ fn source_label(source: SourceLanguage, t: &UiStrings) -> String {
 
 struct LumeSubApp {
     source_text: String,
-    translation_text: String,
+    /// 翻訳窓の上段（確定文）と下段（翻訳中の追補）
+    translation_final: String,
+    translation_streaming: String,
     receiver: Arc<Mutex<mpsc::Receiver<AppEvent>>>,
     controller: PipelineController,
     langs: SharedLanguageConfig,
+    generation: SharedGeneration,
+    source_guard: DisplayGuard,
+    source_ledger: SentenceLedger,
+    /// 寿命管理の対象となる直近の原文（順序つき更新の原文）。即時文では None
+    source_live: Option<String>,
+    translation_tail: TranslationTail,
+    last_sentence_refresh: Instant,
     store: SharedStore,
     follow_diag: DiagLog,
     follow_diag_translation: DiagLog,
@@ -596,6 +1513,11 @@ struct LumeSubApp {
     placed_initial: bool,
     placed_translation_initial: bool,
     control_saved: Option<geometry::WindowGeometry>,
+    /// 終了時の確定保存用に毎フレーム覚える現在幾何。
+    /// 実窓が古いドラッグ中は更新しない（保存値が正）
+    last_source_geom: Option<geometry::WindowGeometry>,
+    last_translation_geom: Option<geometry::WindowGeometry>,
+    last_control_geom: Option<geometry::WindowGeometry>,
     placed_control_initial: bool,
     settings_open: bool,
     settings_draft: ApiConfig,
@@ -604,9 +1526,12 @@ struct LumeSubApp {
     /// 整形済み字幕の覚え書き（論理文・幅・字体・視覚文）。変化時のみ再計算する
     source_cache: (String, u32, String, String),
     translation_cache: (String, u32, String, String),
+    translation_live_cache: (String, u32, String, String),
     /// 読込済みフォントの選択肢（ID・書体名・スクリプト）。言語別に
     /// 絞り込んで字幕の字体切替に使う
     loaded_fonts: Vec<(String, String, Script)>,
+    /// 計測ログの時刻原点。パイプラインと共有する
+    t0: Instant,
 }
 
 /// 設定ダイアログでの操作
@@ -626,6 +1551,7 @@ impl LumeSubApp {
         initial_text: String,
         controller: PipelineController,
         langs: SharedLanguageConfig,
+        generation: SharedGeneration,
         store: SharedStore,
         restored: bool,
         control_saved: Option<geometry::WindowGeometry>,
@@ -633,6 +1559,7 @@ impl LumeSubApp {
         settings_open: bool,
         settings_draft: ApiConfig,
         loaded_fonts: Vec<(String, String, Script)>,
+        t0: Instant,
     ) -> Self {
         let (tx_internal, rx_internal) = mpsc::channel(100);
         let (show_source_draft, show_translation_draft) = {
@@ -641,10 +1568,16 @@ impl LumeSubApp {
         };
         let app = Self {
             source_text: initial_text,
-            translation_text: String::new(),
+            translation_final: String::new(),
+            translation_streaming: String::new(),
             receiver: Arc::new(Mutex::new(rx_internal)),
             controller,
             langs,
+            generation,
+            source_guard: DisplayGuard::new(),
+            source_ledger: SentenceLedger::new(),
+            source_live: None,
+            translation_tail: TranslationTail::new(),
             store,
             follow_diag: DiagLog::new(),
             follow_diag_translation: DiagLog::new(),
@@ -662,6 +1595,9 @@ impl LumeSubApp {
             placed_initial: restored,
             placed_translation_initial: false,
             control_saved,
+            last_source_geom: None,
+            last_translation_geom: None,
+            last_control_geom: None,
             placed_control_initial: control_restored,
             settings_open,
             settings_draft,
@@ -669,7 +1605,10 @@ impl LumeSubApp {
             show_translation_draft,
             source_cache: (String::new(), u32::MAX, String::new(), String::new()),
             translation_cache: (String::new(), u32::MAX, String::new(), String::new()),
+            translation_live_cache: (String::new(), u32::MAX, String::new(), String::new()),
             loaded_fonts,
+            t0,
+            last_sentence_refresh: Instant::now(),
         };
 
         let receiver_ctx = ctx.clone();
@@ -683,8 +1622,69 @@ impl LumeSubApp {
         app
     }
 
+    /// 終了時点の窓位置・サイズをファイルへ確定保存する。
+    /// Quit・バツ・on_exit の共通処理
+    fn save_geometries_now(&self) {
+        if let Ok(mut s) = self.store.lock() {
+            s.persist_geometries(
+                exit_geometry_to_persist(self.fs_drag.is_dirty(), self.last_source_geom),
+                exit_geometry_to_persist(
+                    self.fs_drag_translation.is_dirty(),
+                    self.last_translation_geom,
+                ),
+                self.last_control_geom,
+            );
+        }
+    }
+
+    /// 寿命切れの文を両窓から落とす。500msに1回だけ再計算し、変化があれば真
+    fn refresh_sentence_expiry(
+        &mut self,
+        now: Instant,
+        source_max: usize,
+        translation_max: usize,
+    ) -> bool {
+        if now.duration_since(self.last_sentence_refresh) < Duration::from_millis(500) {
+            return false;
+        }
+        self.last_sentence_refresh = now;
+        let mut changed = false;
+        if let Some(live) = self.source_live.as_ref() {
+            let rendered =
+                text::tail_for_display(&self.source_ledger.filter_fresh(live, now), source_max)
+                    .to_string();
+            if rendered != self.source_text {
+                self.source_text = rendered;
+                dev_log!("🕐 寿命切れの原文を消去");
+                changed = true;
+            }
+        }
+        let rendered_final = text::tail_for_display(
+            &self.translation_tail.render_finalized(now),
+            translation_max,
+        )
+        .to_string();
+        if rendered_final != self.translation_final {
+            self.translation_final = rendered_final;
+            dev_log!("🕐 寿命切れの訳を消去");
+            changed = true;
+        }
+        let rendered_live = text::tail_for_display(
+            &self.translation_tail.render_streaming(now),
+            translation_max,
+        )
+        .to_string();
+        if rendered_live != self.translation_streaming {
+            self.translation_streaming = rendered_live;
+            changed = true;
+        }
+        changed
+    }
+
     /// アプリ終了（Quitボタン・コントロール窓のバツ共通）
     fn quit(&self, ctx: &egui::Context) {
+        // 終了前に窓位置・サイズをかならず保存する（on_exit の前に確定させる）
+        self.save_geometries_now();
         self.controller.stop();
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
     }
@@ -737,8 +1737,6 @@ impl LumeSubApp {
             let hint = shape_for_display(s.ui_locale().strings().drag_to_move).into_owned();
             (hint, s.show_source())
         };
-        let text = &self.translation_text;
-        let cache = &mut self.translation_cache;
         let font = {
             let s = self.store.lock().expect("store lock poisoned");
             let choices = fonts::choices_for(
@@ -748,10 +1746,24 @@ impl LumeSubApp {
             fonts::subtitle_font_id(s.translation_font(), &choices, s.translation_font_size())
         };
         egui::CentralPanel::default().show(ctx, |ui| {
+            // 上段＝確定文（白・太字）、下段＝翻訳中（灰色）。空の区画は出さない
+            let mut parts = [
+                PaintPart {
+                    text: &self.translation_final,
+                    cache: &mut self.translation_cache,
+                    color: egui::Color32::WHITE,
+                    strong: true,
+                },
+                PaintPart {
+                    text: &self.translation_streaming,
+                    cache: &mut self.translation_live_cache,
+                    color: egui::Color32::from_gray(175),
+                    strong: false,
+                },
+            ];
             if paint_subtitle_window(
                 ui,
-                text,
-                cache,
+                &mut parts,
                 font.clone(),
                 interactive,
                 &drag_hint,
@@ -849,7 +1861,7 @@ impl LumeSubApp {
         ui.label(sh(&t.status_line(status_label(self.controller.status(), t))));
         ui.separator();
 
-        // 入出力言語の切替。変えたら Store に即保存する
+        // 入出力言語の切替。変えたら Store に即保存し、字幕を即切り替える
         let changed = if let Ok(mut langs) = self.langs.lock() {
             let before = langs.clone();
             egui::ComboBox::from_label(sh(t.input_language))
@@ -883,7 +1895,7 @@ impl LumeSubApp {
                 });
             ui.label(shape_for_display(&t.settings_line(&langs.describe())).into_owned());
             if *langs != before {
-                Some(langs.clone())
+                Some((before, langs.clone()))
             } else {
                 None
             }
@@ -891,11 +1903,46 @@ impl LumeSubApp {
             ui.colored_label(egui::Color32::RED, sh(t.lang_read_failed));
             None
         };
-        if let Some(cfg) = changed {
+        if let Some((before, cfg)) = changed {
             self.store
                 .lock()
                 .expect("store lock poisoned")
                 .set_languages(cfg.source, cfg.target);
+            // 旧世代の遅延訳を捨て、窓を即切り替える
+            let next_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            self.source_guard.reset(next_gen);
+            self.translation_tail.reset();
+            if before.source != cfg.source {
+                // 入力が変わったら両窓を空にしてASRを繋ぎ直す（bias即反映）
+                self.source_ledger.reset();
+                self.source_live = None;
+                self.source_text.clear();
+                self.translation_final.clear();
+                self.translation_streaming.clear();
+                self.source_cache = (String::new(), u32::MAX, String::new(), String::new());
+                self.translation_cache =
+                    (String::new(), u32::MAX, String::new(), String::new());
+                self.translation_live_cache =
+                    (String::new(), u32::MAX, String::new(), String::new());
+                let status = self.controller.status();
+                if status == CaptureState::Running || status == CaptureState::Paused {
+                    let was_paused = status == CaptureState::Paused;
+                    self.controller.stop();
+                    self.controller.start();
+                    if was_paused {
+                        self.controller.pause();
+                    }
+                    dev_log!("🈯 入力言語の変更を即反映しました");
+                }
+            } else {
+                // 出力のみは翻訳窓だけ空にする（原文は有効なまま）
+                self.translation_final.clear();
+                self.translation_streaming.clear();
+                self.translation_cache =
+                    (String::new(), u32::MAX, String::new(), String::new());
+                self.translation_live_cache =
+                    (String::new(), u32::MAX, String::new(), String::new());
+            }
         }
         ui.small(sh(t.input_note));
         ui.separator();
@@ -1145,6 +2192,11 @@ impl LumeSubApp {
 
 impl eframe::App for LumeSubApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ROOT のバツ・Cmd+Q 等でも窓位置・サイズをかならず保存する。
+        // この後 on_exit でも保存するが、二重保存は無害
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.save_geometries_now();
+        }
         if let Ok(mut rx) = self.receiver.try_lock() {
             // 累積文は末尾に丸めて表示する（古い文が残り続けないよう）
             let (source_max, translation_max) = {
@@ -1154,15 +2206,108 @@ impl eframe::App for LumeSubApp {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     AppEvent::UpdateSource(text) => {
+                        // 新セッションの待機文は無条件で出し、古い順序記憶を捨てる
+                        let current = self.generation.load(Ordering::Relaxed);
+                        self.source_guard.reset(current);
+                        self.source_ledger.reset();
+                        self.source_live = None;
+                        self.translation_tail.reset();
                         self.source_text =
                             text::tail_for_display(&text, source_max).to_string();
                     }
+                    AppEvent::UpdateSourceSeq(update) => {
+                        if update.generation != self.generation.load(Ordering::Relaxed) {
+                            dev_log!(
+                                "🗑️ 旧世代の原文を破棄: turn={} seq={}",
+                                update.turn,
+                                update.seq
+                            );
+                            continue;
+                        }
+                        if self.source_guard.accept(&update) {
+                            self.source_ledger.note(
+                                update.generation,
+                                &update.text,
+                                update.spawned_at,
+                            );
+                            self.source_live = Some(update.text.clone());
+                            self.source_text = text::tail_for_display(
+                                &self
+                                    .source_ledger
+                                    .filter_fresh(&update.text, Instant::now()),
+                                source_max,
+                            )
+                            .to_string();
+                            dev_log!(
+                                "⏱ {}",
+                                serde_json::json!({"t": self.t0.elapsed().as_millis(), "ev": "show", "which": "src", "turn": update.turn, "seq": update.seq, "chars": update.text.chars().count()})
+                            );
+                        } else {
+                            dev_log!(
+                                "🗑️ 古い原文を破棄: turn={} seq={}",
+                                update.turn,
+                                update.seq
+                            );
+                            dev_log!(
+                                "⏱ {}",
+                                serde_json::json!({"t": self.t0.elapsed().as_millis(), "ev": "drop", "which": "src", "turn": update.turn, "seq": update.seq})
+                            );
+                        }
+                    }
                     AppEvent::UpdateTranslation(text) => {
-                        self.translation_text =
+                        self.translation_tail.reset();
+                        self.translation_final =
                             text::tail_for_display(&text, translation_max).to_string();
+                        self.translation_streaming.clear();
+                    }
+                    AppEvent::UpdateTranslationSeq(update) => {
+                        if update.generation != self.generation.load(Ordering::Relaxed) {
+                            dev_log!(
+                                "🗑️ 旧世代の訳を破棄: turn={} seq={}",
+                                update.turn,
+                                update.seq
+                            );
+                            continue;
+                        }
+                        if self.translation_tail.push(&update) {
+                            let now = Instant::now();
+                            self.translation_final = text::tail_for_display(
+                                &self.translation_tail.render_finalized(now),
+                                translation_max,
+                            )
+                            .to_string();
+                            self.translation_streaming = text::tail_for_display(
+                                &self.translation_tail.render_streaming(now),
+                                translation_max,
+                            )
+                            .to_string();
+                            dev_log!(
+                                "⏱ {}",
+                                serde_json::json!({"t": self.t0.elapsed().as_millis(), "ev": "show", "which": "tr", "turn": update.turn, "seq": update.seq, "chars": update.text.chars().count()})
+                            );
+                        } else {
+                            dev_log!(
+                                "🗑️ 古い訳を破棄: turn={} seq={}",
+                                update.turn,
+                                update.seq
+                            );
+                            dev_log!(
+                                "⏱ {}",
+                                serde_json::json!({"t": self.t0.elapsed().as_millis(), "ev": "drop", "which": "tr", "turn": update.turn, "seq": update.seq})
+                            );
+                        }
                     }
                 }
             }
+        }
+
+        // 寿命切れの文を落とす（表示更新がなくても古文が消える）
+        {
+            let (source_max, translation_max) = {
+                let s = self.store.lock().expect("store lock poisoned");
+                (s.source_tail_chars(), s.translation_tail_chars())
+            };
+            self.refresh_sentence_expiry(Instant::now(), source_max, translation_max);
         }
 
         let (show_source, show_translation, follow) = {
@@ -1271,20 +2416,14 @@ impl eframe::App for LumeSubApp {
                                 w: rect.width(),
                                 h: rect.height(),
                             };
-                            {
-                                let mut s =
-                                    self.store.lock().expect("store lock poisoned");
-                                s.set_source_geometry(g);
-                                if out.finished {
-                                    s.flush();
-                                }
-                            }
+                            self.store
+                                .lock()
+                                .expect("store lock poisoned")
+                                .set_source_geometry(g);
                             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
                                 rect.min,
                             ));
                             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(rect.size()));
-                        } else if out.finished {
-                            self.store.lock().expect("store lock poisoned").flush();
                         }
                         if out.close_requested {
                             hide_subtitle(&self.store, true);
@@ -1318,7 +2457,7 @@ impl eframe::App for LumeSubApp {
                 &mut self.follow_diag,
             );
         }
-        // 原文窓の移動・リサイズを間引き保存する。
+        // 原文窓の移動・リサイズをメモリに追跡する（ファイル保存は終了時のみ）。
         // ドラッグ中は古い実窓で保存値を上書きしない
         let source_geom = ctx.input(|i| {
             match (
@@ -1337,10 +2476,11 @@ impl eframe::App for LumeSubApp {
         if !self.fs_drag.is_dirty()
             && let Some(current) = &source_geom
         {
+            self.last_source_geom = Some(*current);
             self.store
                 .lock()
                 .expect("store lock poisoned")
-                .offer_source(current);
+                .track_source(current);
         }
 
         let drag_hint = {
@@ -1362,10 +2502,15 @@ impl eframe::App for LumeSubApp {
             fonts::subtitle_font_id(s.source_font(), &choices, s.source_font_size())
         };
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut parts = [PaintPart {
+                text: &self.source_text,
+                cache: &mut self.source_cache,
+                color: egui::Color32::WHITE,
+                strong: true,
+            }];
             if paint_subtitle_window(
                 ui,
-                &self.source_text,
-                &mut self.source_cache,
+                &mut parts,
                 source_font.clone(),
                 interactive,
                 &drag_hint,
@@ -1407,10 +2552,11 @@ impl eframe::App for LumeSubApp {
             control_current = self.control_frame(ctx);
         });
         if let Some(current) = &control_current {
+            self.last_control_geom = Some(*current);
             self.store
                 .lock()
                 .expect("store lock poisoned")
-                .offer_control(current);
+                .track_control(current);
         }
         // 初回（保存なし）はモニター情報が掴めた初フレームで右上へ
         if !self.placed_control_initial
@@ -1459,10 +2605,11 @@ impl eframe::App for LumeSubApp {
             if !self.fs_drag_translation.is_dirty()
                 && let Some(current) = &translation_current
             {
+                self.last_translation_geom = Some(*current);
                 self.store
                     .lock()
                     .expect("store lock poisoned")
-                    .offer_translation(current);
+                    .track_translation(current);
             }
             let translation_outer = translation_current.map(rect_from_geometry);
             // 翻訳窓も常時最前面に。窓が出るまで毎フレーム試す
@@ -1502,12 +2649,22 @@ impl eframe::App for LumeSubApp {
                     .expect("store lock poisoned")
                     .translation_font()
                     .to_string();
+                let mirror_text = if self.translation_streaming.is_empty() {
+                    self.translation_final.clone()
+                } else if self.translation_final.is_empty() {
+                    self.translation_streaming.clone()
+                } else {
+                    format!(
+                        "{}\n{}",
+                        self.translation_final, self.translation_streaming
+                    )
+                };
                 let shown = screen::sync_fullscreen_panel(
                     &mut self.fs_panel_translation,
                     screen::window_occlusion_visible(TRANSLATION_VIEWPORT_TITLE),
                     mirror,
                     flip_h,
-                    &self.translation_text,
+                    &mirror_text,
                     panel_font_size,
                     &panel_font,
                     &mut self.panel_diag_translation,
@@ -1538,14 +2695,10 @@ impl eframe::App for LumeSubApp {
                                 w: rect.width(),
                                 h: rect.height(),
                             };
-                            {
-                                let mut s =
-                                    self.store.lock().expect("store lock poisoned");
-                                s.set_translation_geometry(g);
-                                if out.finished {
-                                    s.flush();
-                                }
-                            }
+                            self.store
+                                .lock()
+                                .expect("store lock poisoned")
+                                .set_translation_geometry(g);
                             ctx.send_viewport_cmd_to(
                                 translation_id,
                                 egui::ViewportCommand::OuterPosition(rect.min),
@@ -1554,8 +2707,6 @@ impl eframe::App for LumeSubApp {
                                 translation_id,
                                 egui::ViewportCommand::InnerSize(rect.size()),
                             );
-                        } else if out.finished {
-                            self.store.lock().expect("store lock poisoned").flush();
                         }
                         if out.close_requested {
                             hide_subtitle(&self.store, false);
@@ -1655,6 +2806,12 @@ impl eframe::App for LumeSubApp {
             }
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 終了時点の窓位置・サイズを確定保存する（Quit 経路の保存漏れへの安全網。
+        // 既に保存済みでも同じ内容の上書きで無害）
+        self.save_geometries_now();
+    }
 }
 
 #[cfg(test)]
@@ -1686,6 +2843,904 @@ mod tests {
     }
 
     #[test]
+    fn sentence_marks_counts_end_marks() {
+        assert_eq!(sentence_marks("Hello. World"), 1);
+        assert_eq!(sentence_marks("Hello. World."), 2);
+        assert_eq!(sentence_marks("こんにちは。元気？"), 2);
+        assert_eq!(sentence_marks("看视频，开会。"), 1);
+        assert_eq!(sentence_marks("مرحبا؟"), 1);
+        assert_eq!(sentence_marks("नमस्ते।"), 1);
+        // 小数は文末にしない
+        assert_eq!(sentence_marks("3.5kg"), 0);
+        assert_eq!(sentence_marks("まだ途中"), 0);
+        assert_eq!(sentence_marks(""), 0);
+    }
+
+    #[test]
+    fn sentence_ready_fires_on_new_sentence_end() {
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        // 文末なし→発火しない
+        assert!(!p.sentence_ready("hello"));
+        // 新しい文末→間引き内でも発火する
+        assert!(p.sentence_ready("hello. world"));
+        p.note_translated("hello. world".into(), "こんにちは。世界".into(), t0);
+        assert!(!p.sentence_ready("hello. world"));
+        // 2文目が終わったら再発火
+        assert!(p.sentence_ready("hello. world. next"));
+        p.note_translated(
+            "hello. world. next".into(),
+            "こんにちは。世界。次".into(),
+            t0,
+        );
+        assert!(!p.sentence_ready("hello. world. next"));
+        // ターン確定で次ターンは0から数え直す
+        p.note_turn_end();
+        assert!(!p.sentence_ready("new turn"));
+        assert!(p.sentence_ready("new turn."));
+    }
+
+    #[test]
+    fn leading_preview_fires_once_per_turn() {
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        // ターン冒頭の途中文は即訳する
+        assert!(p.leading_ready("hello"));
+        assert!(!p.leading_ready(""));
+        p.note_spawned("hello".into(), t0);
+        // 投げたら次は発火しない（文末・間引きに任せる）
+        assert!(!p.leading_ready("hello world"));
+        // ターン確定で次の冒頭に備える
+        p.note_turn_end();
+        assert!(p.leading_ready("next turn"));
+    }
+
+    #[test]
+    fn sentence_preview_still_fires_after_leading() {
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        p.note_spawned("hello".into(), t0);
+        // 冒頭訳のあとも新しい文末では訳す
+        assert!(p.sentence_ready("hello. world"));
+        assert!(!p.leading_ready("hello. world"));
+    }
+
+    #[test]
+    fn leading_preview_waits_for_min_chars() {
+        let p = PartialTracker::new();
+        // 1字の断片では投げない。2字から投げる
+        assert!(!p.leading_ready("あ"));
+        assert!(p.leading_ready("ab"));
+        assert!(p.leading_ready("abc"));
+    }
+
+    #[test]
+    fn growth_preview_fires_on_text_growth() {
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        p.note_spawned("hello".into(), t0);
+        // 少しの伸びでは発火しない
+        assert!(!p.growth_ready("hello world"));
+        // 10字以上の伸びで発火する
+        let grown = format!("hello world{}", "x".repeat(10));
+        assert!(p.growth_ready(&grown));
+        // 送信後は同文で発火しない
+        p.note_spawned(grown.clone(), t0);
+        assert!(!p.growth_ready(&grown));
+        // ターン確定で0から数え直す
+        p.note_turn_end();
+        assert!(p.growth_ready(&"y".repeat(10)));
+        assert!(!p.growth_ready(&"y".repeat(9)));
+    }
+
+    #[test]
+    fn slow_mode_keeps_translating_unpunctuated_partials() {
+        // 句読点のない累積部分文でも翻訳が止まらない（動画の再現）
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        let mut fires = 0;
+        for len in 1..=100 {
+            let text: String = "あ".repeat(len);
+            if p.preview_trigger(&text, false, t0).is_some() {
+                fires += 1;
+                p.note_spawned(text, t0);
+            }
+        }
+        // 冒頭1回＋10字ごとの追補9回
+        assert_eq!(fires, 10);
+    }
+
+    #[test]
+    fn preview_trigger_matches_configured_defaults() {
+        // 実動作と記録再生が同じ判定を使うことの担保
+        let p = PartialTracker::new();
+        let t0 = Instant::now();
+        for text in [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "hello.",
+            "hello. world. more text here yes",
+        ] {
+            for fast in [false, true] {
+                assert_eq!(
+                    p.preview_trigger(text, fast, t0),
+                    p.preview_trigger_cfg(
+                        text,
+                        fast,
+                        t0,
+                        PREVIEW_GROWTH_CHARS,
+                        LEADING_MIN_CHARS
+                    ),
+                    "{text:?} fast={fast}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_tracker_async_spawn_then_complete() {
+        use std::time::Duration;
+        let mut p = PartialTracker::new();
+        let t0 = Instant::now();
+        // 起動時は訳せる
+        assert!(p.should_translate("hello.", t0));
+        // 送信時点では間引きが効くが、使い回しはまだできない
+        p.note_spawned("hello.".into(), t0);
+        assert!(!p.should_translate("hello. world", t0));
+        assert_eq!(p.reuse("hello."), None);
+        // 完了で使い回せる
+        p.note_completed("hello.".into(), "こんにちは。".into());
+        assert_eq!(p.reuse("hello."), Some("こんにちは。".to_string()));
+        // 新しい送信で古い訳は無効になる
+        let t1 = t0 + Duration::from_secs(2);
+        assert!(p.should_translate("hello. world.", t1));
+        p.note_spawned("hello. world.".into(), t1);
+        assert_eq!(p.reuse("hello. world."), None);
+        // 古い完了は新しい送信を上書きしない
+        p.note_completed("hello.".into(), "古い".into());
+        assert_eq!(p.reuse("hello. world."), None);
+        p.note_completed("hello. world.".into(), "こんにちは。世界。".into());
+        assert_eq!(
+            p.reuse("hello. world."),
+            Some("こんにちは。世界。".to_string())
+        );
+    }
+
+    #[test]
+    fn display_guard_drops_stale_sentence() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut g = DisplayGuard::new();
+        // 初回は受け付ける
+        let first = SubtitleUpdate::at("uno".into(), 1, 1, 0, t0);
+        assert!(g.accept(&first));
+        // 同順序・同時刻の複製は受け付ける（ストリーミング追補と区別しない。
+        // 同一トリガーの文言は増える一方なので、再描画しても害がない）
+        let dup_old = SubtitleUpdate::at("uno".into(), 1, 1, 0, t0);
+        assert!(g.accept(&dup_old));
+        // 同じターンの新しい文は受け付ける
+        let second = SubtitleUpdate::at("uno dos".into(), 1, 2, 0, t0 + Duration::from_millis(10));
+        assert!(g.accept(&second));
+        // 新しいターンは受け付ける
+        let next_turn = SubtitleUpdate::at("next".into(), 2, 3, 0, t0 + Duration::from_millis(20));
+        assert!(g.accept(&next_turn));
+        // 古いターンの遅延到着は捨てる（seq が新しくても）
+        let late_old = SubtitleUpdate::at("uno late".into(), 1, 99, 0, t0 + Duration::from_millis(30));
+        assert!(!g.accept(&late_old));
+        // 古い世代は捨てる
+        let old_gen = SubtitleUpdate::at("old".into(), 5, 100, 0, t0 + Duration::from_millis(40));
+        let mut g2 = DisplayGuard::new();
+        g2.reset(1);
+        assert!(!g2.accept(&old_gen));
+        // 新しい世代は受け付ける（ターン番号が若くても）
+        let new_gen = SubtitleUpdate::at("new".into(), 1, 101, 1, t0 + Duration::from_millis(50));
+        assert!(g2.accept(&new_gen));
+    }
+
+    #[test]
+    fn display_guard_accepts_streaming_progress() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut g = DisplayGuard::new();
+        // 同一トリガーの追補（同順序・新時刻）は受け付ける
+        let first = SubtitleUpdate::at("He".into(), 1, 5, 0, t0);
+        assert!(g.accept(&first));
+        let progress =
+            SubtitleUpdate::at("Hello".into(), 1, 5, 0, t0 + Duration::from_millis(150));
+        assert!(g.accept(&progress));
+        // 同順序でも古い時刻の到着は捨てる
+        let late = SubtitleUpdate::at("Hel".into(), 1, 5, 0, t0 + Duration::from_millis(100));
+        assert!(!g.accept(&late));
+    }
+
+    /// 上段（確定）・下段（追補）の表示文
+    fn rendered(tail: &TranslationTail, now: Instant) -> (String, String) {
+        (tail.render_finalized(now), tail.render_streaming(now))
+    }
+
+    #[test]
+    fn translation_tail_carries_previous_turn_final() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // 現行ターンの追補と確定
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Lume …".into(),
+            1,
+            1,
+            0,
+            t0
+        )));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Lume captures audio.".into(),
+            1,
+            2,
+            0,
+            t0 + Duration::from_millis(10)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            ("Lume captures audio.".to_string(), String::new())
+        );
+        // 新ターンの追補が来ても確定文だけ出す
+        assert!(tail.push(&SubtitleUpdate::at(
+            "The …".into(),
+            2,
+            3,
+            0,
+            t0 + Duration::from_millis(20)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            ("Lume captures audio.".to_string(), "The …".to_string())
+        );
+        // 旧ターンの遅延確定は前ターン枠に救済する（捨てない）
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Lume captures audio. Watch.".into(),
+            1,
+            4,
+            0,
+            t0 + Duration::from_millis(30)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            (
+                "Lume captures audio.\nWatch.".to_string(),
+                "The …".to_string()
+            )
+        );
+        // 新ターンの追補が来ても確定文だけ出す
+        assert!(tail.push(&SubtitleUpdate::at(
+            "You …".into(),
+            3,
+            5,
+            0,
+            t0 + Duration::from_millis(40)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            (
+                "Lume captures audio.\nWatch.".to_string(),
+                "You …".to_string()
+            )
+        );
+        // さらに新ターンが来たら3つ前は落ちる
+        assert!(tail.push(&SubtitleUpdate::at(
+            "T4 …".into(),
+            4,
+            6,
+            0,
+            t0 + Duration::from_millis(50)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            (String::new(), "T4 …".to_string())
+        );
+        // 3つ前の遅延到着は捨てる
+        assert!(!tail.push(&SubtitleUpdate::at(
+            "Lume late".into(),
+            1,
+            99,
+            0,
+            t0 + Duration::from_millis(60)
+        )));
+    }
+
+    /// 動画23:55のt13再現：前ターン確定の寿命内に次ターン確定が来たら両方出す
+    #[test]
+    fn translation_tail_keeps_final_across_next_turn_complete() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // Bターンの追補（プレビュー由来）
+        assert!(tail.push(&SubtitleUpdate::at("Hello …".into(), 2, 10, 0, t0)));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Hello, I'm L …".into(),
+            2,
+            10,
+            0,
+            t0 + Duration::from_millis(1700)
+        )));
+        // Bターンの確定（complete要求の最終文）
+        assert!(tail.push(&SubtitleUpdate::at(
+            "This is LumeSub.".into(),
+            2,
+            11,
+            0,
+            t0 + Duration::from_millis(1800)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(2000)),
+            ("This is LumeSub.".to_string(), String::new())
+        );
+        // Cターンの確定（モデル由来の "..." 付き確定文）。B確定の寿命内
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Real-time translation subtitles ...".into(),
+            3,
+            12,
+            0,
+            t0 + Duration::from_millis(4100)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(4500)),
+            (
+                "This is LumeSub.\nReal-time translation subtitles ...".to_string(),
+                String::new()
+            )
+        );
+    }
+
+    /// 同一ターン内で確定文が別文に置き換わったら別発話として両方残す。
+    /// プロバイダが turnId を進めない場合の救済（動画23:55のt13相当）
+    #[test]
+    fn translation_tail_splits_same_turn_completed_collision() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        assert!(tail.push(&SubtitleUpdate::at("This is LumeSub.".into(), 2, 11, 0, t0)));
+        // 同じターン番号で別内容の確定文が来たら上書きせず新枠へずらす
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Real-time translation subtitles ...".into(),
+            2,
+            12,
+            0,
+            t0 + Duration::from_millis(2300)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(2700)),
+            (
+                "This is LumeSub.\nReal-time translation subtitles ...".to_string(),
+                String::new()
+            )
+        );
+        // 同文の再送は上書き（期限の延長）のまま
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Real-time translation subtitles ...".into(),
+            2,
+            13,
+            0,
+            t0 + Duration::from_millis(2800)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(2900)),
+            (
+                "This is LumeSub.\nReal-time translation subtitles ...".to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[test]
+    fn translation_tail_orders_within_slot() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        assert!(tail.push(&SubtitleUpdate::at("B".into(), 2, 3, 0, t0)));
+        // 同ターンの古い順序は捨てる
+        assert!(!tail.push(&SubtitleUpdate::at(
+            "A".into(),
+            2,
+            2,
+            0,
+            t0 + Duration::from_millis(10)
+        )));
+        // 同順序の追補は新時刻だけ受け付ける
+        assert!(tail.push(&SubtitleUpdate::at(
+            "B …".into(),
+            2,
+            3,
+            0,
+            t0 + Duration::from_millis(20)
+        )));
+        assert!(!tail.push(&SubtitleUpdate::at(
+            "B …".into(),
+            2,
+            3,
+            0,
+            t0 + Duration::from_millis(10)
+        )));
+        // 確定文がなければ最新の追補を下段に出す
+        assert!(tail.push(&SubtitleUpdate::at(
+            "C …".into(),
+            3,
+            4,
+            0,
+            t0 + Duration::from_millis(30)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            (String::new(), "C …".to_string())
+        );
+        // 前ターンの確定が届いたら上段に出す
+        assert!(tail.push(&SubtitleUpdate::at(
+            "B done.".into(),
+            2,
+            5,
+            0,
+            t0 + Duration::from_millis(40)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            ("B done.".to_string(), "C …".to_string())
+        );
+    }
+
+    #[test]
+    fn translation_tail_resets_on_generation() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        assert!(tail.push(&SubtitleUpdate::at(
+            "old".into(),
+            7,
+            1,
+            0,
+            t0
+        )));
+        // 世代が変わったら旧枠を捨て、若いターン番号から始める
+        assert!(tail.push(&SubtitleUpdate::at(
+            "new …".into(),
+            1,
+            2,
+            1,
+            t0 + Duration::from_millis(10)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_secs(1)),
+            (String::new(), "new …".to_string())
+        );
+    }
+
+    #[test]
+    fn translation_tail_expires_old_sentences() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        // "Old done." の寿命4秒（最短表示）。期限 t0+4秒、"New …" は t0+5秒
+        let mut tail = TranslationTail::new();
+        assert!(tail.push(&SubtitleUpdate::at("Old done.".into(), 1, 1, 0, t0)));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "New …".into(),
+            2,
+            2,
+            0,
+            t0 + Duration::from_secs(1)
+        )));
+        // 確定文は上段、追補は下段に出る
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(2500)),
+            ("Old done.".to_string(), "New …".to_string())
+        );
+        // 旧文だけ寿命切れで落ちる
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(4500)),
+            (String::new(), "New …".to_string())
+        );
+        // 両方切れたら空になる
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(5500)),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn translation_tail_refreshes_streaming_sentences() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // 累積文に含まれる文は追補のたび寿命が延びる
+        // （"First." の寿命4秒に対し、追補で期限が t0+4秒 → t0+5秒へ延びる）
+        assert!(tail.push(&SubtitleUpdate::at(
+            "First. Sec …".into(),
+            1,
+            1,
+            0,
+            t0
+        )));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "First. Second …".into(),
+            1,
+            2,
+            0,
+            t0 + Duration::from_secs(1)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(4500)),
+            (String::new(), "First.\nSecond …".to_string())
+        );
+    }
+
+    #[test]
+    fn translation_tail_splits_finalized_and_streaming() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // 確定文がなければ追補を下段に出す
+        assert!(tail.push(&SubtitleUpdate::at("L1 …".into(), 1, 1, 0, t0)));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(100)),
+            (String::new(), "L1 …".to_string())
+        );
+        // 確定文は上段、追補は下段に分ける
+        assert!(tail.push(&SubtitleUpdate::at(
+            "L2.".into(),
+            2,
+            2,
+            0,
+            t0 + Duration::from_millis(200)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(300)),
+            ("L2.".to_string(), String::new())
+        );
+        assert!(tail.push(&SubtitleUpdate::at(
+            "L1 final.".into(),
+            1,
+            3,
+            0,
+            t0 + Duration::from_millis(400)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(500)),
+            ("L1 final.\nL2.".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn translation_tail_rescues_two_back_late_final() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // 追補だけ3ターン進んでも2つ前の確定は救済し、上下段に分けて出す
+        for (i, text) in ["T1 …", "T2 …", "T3 …"].into_iter().enumerate() {
+            assert!(tail.push(&SubtitleUpdate::at(
+                text.into(),
+                i as i32 + 1,
+                i as u64 + 1,
+                0,
+                t0 + Duration::from_millis(i as u64 * 10)
+            )));
+        }
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(100)),
+            (String::new(), "T3 …".to_string())
+        );
+        assert!(tail.push(&SubtitleUpdate::at(
+            "T1 done.".into(),
+            1,
+            9,
+            0,
+            t0 + Duration::from_millis(200)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(300)),
+            ("T1 done.".to_string(), "T3 …".to_string())
+        );
+    }
+
+    #[test]
+    fn translation_tail_rejects_shorter_streaming_regression() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // 同ターンの追補は表示文より短くならない（長い→短い→長いの瞬き防止）
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Long streaming text …".into(),
+            1,
+            1,
+            0,
+            t0
+        )));
+        // 新要求の出始め（短い追補）は採らない
+        assert!(!tail.push(&SubtitleUpdate::at(
+            "Short …".into(),
+            1,
+            2,
+            0,
+            t0 + Duration::from_millis(100)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(200)),
+            (String::new(), "Long streaming text …".to_string())
+        );
+        // 追いついたら採用する
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Long streaming text grows …".into(),
+            1,
+            3,
+            0,
+            t0 + Duration::from_millis(300)
+        )));
+        // 短い確定文はつねに採用する
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Final.".into(),
+            1,
+            4,
+            0,
+            t0 + Duration::from_millis(400)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(500)),
+            ("Final.".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn progress_text_skips_empty_accumulation() {
+        assert_eq!(progress_text(""), None);
+        assert_eq!(progress_text("  "), None);
+        assert_eq!(progress_text("Hello"), Some("Hello …".to_string()));
+    }
+
+    #[test]
+    fn translation_tail_skips_expired_anchor() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        assert!(tail.push(&SubtitleUpdate::at("Old done.".into(), 1, 1, 0, t0)));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "T2 …".into(),
+            2,
+            2,
+            0,
+            t0 + Duration::from_secs(1)
+        )));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "T3 …".into(),
+            3,
+            3,
+            0,
+            t0 + Duration::from_secs(2)
+        )));
+        // 確定文が寿命内は上段に残し、追補は下段に出す
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(2500)),
+            ("Old done.".to_string(), "T3 …".to_string())
+        );
+        // 寿命切れの確定文は選ばず、新しい追補を出す
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(4500)),
+            (String::new(), "T3 …".to_string())
+        );
+    }
+
+    #[test]
+    fn translation_tail_hides_dots_only_sentences() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut tail = TranslationTail::new();
+        // 点々だけの確定文は表示しない（どの文字コードでも）
+        assert!(tail.push(&SubtitleUpdate::at("...".into(), 1, 1, 0, t0)));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(100)),
+            (String::new(), String::new())
+        );
+        // 中身のある文は出す。点々は枠を塞がない
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Real.".into(),
+            2,
+            2,
+            0,
+            t0 + Duration::from_millis(200)
+        )));
+        assert!(tail.push(&SubtitleUpdate::at(
+            "⋯".into(),
+            3,
+            3,
+            0,
+            t0 + Duration::from_millis(300)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(400)),
+            ("Real.".to_string(), String::new())
+        );
+        // 混ざった点々断片だけ落とす
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Mixed. ...".into(),
+            4,
+            4,
+            0,
+            t0 + Duration::from_millis(500)
+        )));
+        assert_eq!(
+            rendered(&tail, t0 + Duration::from_millis(600)),
+            ("Real.\nMixed.".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn translation_tail_pruned_sentence_stays_expired() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let life = text::sentence_lifetime("Ancient history here.");
+        let mut tail = TranslationTail::new();
+        assert!(tail.push(&SubtitleUpdate::at(
+            "Ancient history here.".into(),
+            1,
+            1,
+            0,
+            t0
+        )));
+        // 寿命を超えた後の受け付けで台帳から掃除される
+        assert!(tail.push(&SubtitleUpdate::at(
+            "New stuff …".into(),
+            2,
+            2,
+            0,
+            t0 + life + Duration::from_secs(1)
+        )));
+        // 掃除済みの旧文は復活しない
+        assert_eq!(
+            rendered(&tail, t0 + life + Duration::from_secs(2)),
+            (String::new(), "New stuff …".to_string())
+        );
+    }
+
+    #[test]
+    fn sentence_ledger_resets_on_generation() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let mut l = SentenceLedger::new();
+        l.note(0, "Old.", t0);
+        assert_eq!(l.filter_fresh("Old.", t0 + Duration::from_secs(1)), "Old.");
+        // 世代が変わったら旧文を捨てる
+        l.note(1, "New.", t0 + Duration::from_secs(2));
+        assert_eq!(
+            l.filter_fresh("Old. New.", t0 + Duration::from_secs(3)),
+            "New."
+        );
+        l.reset();
+        assert_eq!(l.filter_fresh("New.", t0 + Duration::from_secs(3)), "");
+    }
+
+    #[test]
+    fn refresh_sentence_expiry_drops_stale_text() {
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = test_app(rt.handle().clone());
+        let old = Instant::now() - text::SUBTITLE_MAX_DISPLAY - Duration::from_secs(1);
+        app.translation_tail
+            .push(&SubtitleUpdate::at("Old done.".into(), 1, 1, 0, old));
+        app.translation_final = "Old done.".to_string();
+        app.translation_streaming = "stale …".to_string();
+        app.source_ledger.note(0, "古い原文。", old);
+        app.source_live = Some("古い原文。".to_string());
+        app.source_text = "古い原文。".to_string();
+        app.last_sentence_refresh = Instant::now() - Duration::from_secs(1);
+        // 寿命切れで両窓とも空になる
+        assert!(app.refresh_sentence_expiry(Instant::now(), 160, 160));
+        assert_eq!(app.translation_final, "");
+        assert_eq!(app.translation_streaming, "");
+        assert_eq!(app.source_text, "");
+        // 500ms以内は再計算しない
+        assert!(!app.refresh_sentence_expiry(Instant::now(), 160, 160));
+    }
+
+    #[test]
+    fn refresh_sentence_expiry_keeps_immediate_and_fresh_text() {
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = test_app(rt.handle().clone());
+        // 即時文（live なし）は寿命管理の対象外
+        app.source_text = "🎧 Listening…".to_string();
+        assert!(app.source_live.is_none());
+        // 新しい訳は残る
+        let now = Instant::now();
+        app.translation_tail
+            .push(&SubtitleUpdate::at("Fresh.".into(), 1, 1, 0, now));
+        app.translation_final = "Fresh.".to_string();
+        app.last_sentence_refresh = now - Duration::from_secs(1);
+        assert!(!app.refresh_sentence_expiry(now, 160, 160));
+        assert_eq!(app.source_text, "🎧 Listening…");
+        assert_eq!(app.translation_final, "Fresh.");
+        assert_eq!(app.translation_streaming, "");
+    }
+
+    #[test]
+    fn turn_stats_summary_counts_pending() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let s = TurnStats {
+            start_at: Some(t0),
+            first_partial_at: Some(t0 + Duration::from_millis(800)),
+            partials: 12,
+            complete: true,
+            xlate_spawned: 3,
+            xlate_ok: 1,
+            xlate_err: 1,
+        };
+        assert_eq!(
+            s.summary(7),
+            "📊 ターン#7: partials=12 初回800ms 確定あり 翻訳要求3(完了1/失敗1/残1)"
+        );
+        // 開始・初回がなければ初回はハイフン
+        let empty = TurnStats::default();
+        assert_eq!(
+            empty.summary(1),
+            "📊 ターン#1: partials=0 初回- 確定なし 翻訳要求0(完了0/失敗0/残0)"
+        );
+    }
+
+    #[test]
+    fn utterance_verdict_reports_recognition() {
+        let mut u = UtteranceWatch {
+            start_ms: 3900,
+            ..Default::default()
+        };
+        assert_eq!(u.verdict(14100), "🔍 音声 3.9–14.1s: 認識なし");
+        u.mark_partial(1);
+        u.mark_partial(1);
+        u.mark_complete(2);
+        assert_eq!(
+            u.verdict(14100),
+            "🔍 音声 3.9–14.1s: 認識あり (turn=1,2 確定あり)"
+        );
+    }
+
+    #[test]
+    fn flush_turn_stats_drops_only_older_turns() {
+        let mut map = BTreeMap::from([(1, TurnStats::default()), (2, TurnStats::default())]);
+        flush_turn_stats(&mut map, 2);
+        assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![2]);
+        flush_turn_stats(&mut map, i32::MAX);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn turn_tracker_advances_monotonically() {
+        let mut t = TurnTracker::new();
+        assert_eq!(t.current(), 0);
+        // 新ターンは進む
+        assert!(t.note_speech_start(1));
+        assert_eq!(t.current(), 1);
+        // 同じ開始の重複では進まない
+        assert!(!t.note_speech_start(1));
+        // 確定で遅れない
+        t.note_complete(1);
+        assert_eq!(t.current(), 1);
+        // 次の開始で進む
+        assert!(t.note_speech_start(2));
+        // 遅延した古い確定・開始では戻らない
+        t.note_complete(1);
+        assert_eq!(t.current(), 2);
+        assert!(!t.note_speech_start(1));
+        assert_eq!(t.current(), 2);
+        // 開始が欠けても確定で追いつく
+        t.note_complete(5);
+        assert_eq!(t.current(), 5);
+        // リセットで0に戻る
+        t.reset();
+        assert_eq!(t.current(), 0);
+    }
+
+    #[test]
     fn font_choice_label_prefers_scripts_name() {
         let loaded = vec![("jp".to_string(), "Japanese".to_string())];
         assert_eq!(font_choice_label(&loaded, "", "Default"), "Default");
@@ -1713,6 +3768,7 @@ mod tests {
             String::new(),
             controller,
             langs,
+            Arc::new(AtomicU64::new(0)),
             store,
             false,
             None,
@@ -1720,6 +3776,7 @@ mod tests {
             false,
             ApiConfig::default(),
             vec![],
+            Instant::now(),
         )
     }
 
@@ -1764,10 +3821,15 @@ mod tests {
         let mut clicked = false;
         let _ = ctx.run(click_input(pos, pressed), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
+                let mut parts = [PaintPart {
+                    text: "hello",
+                    cache,
+                    color: egui::Color32::WHITE,
+                    strong: true,
+                }];
                 clicked = paint_subtitle_window(
                     ui,
-                    "hello",
-                    cache,
+                    &mut parts,
                     egui::FontId::proportional(28.0),
                     true,
                     "drag",
@@ -1799,6 +3861,95 @@ mod tests {
             app.control_frame(ctx);
         });
         assert!(root_commands(&closed).contains(&egui::ViewportCommand::Close));
+    }
+
+    #[test]
+    fn exit_geometry_to_persist_skips_dirty_drag() {
+        let g = geometry::WindowGeometry {
+            x: 1.0,
+            y: 2.0,
+            w: 3.0,
+            h: 4.0,
+        };
+        // ドラッグ中（実窓が古い）は渡さず、メモリ側のドラッグ値を据え置く
+        assert_eq!(exit_geometry_to_persist(true, Some(g)), None);
+        assert_eq!(exit_geometry_to_persist(false, Some(g)), Some(g));
+        assert_eq!(exit_geometry_to_persist(false, None), None);
+    }
+
+    fn quit_scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lume-{}-{}.json", name, std::process::id()))
+    }
+
+    #[test]
+    fn quit_saves_window_geometries_to_file() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = test_app(rt.handle().clone());
+        let path = quit_scratch("quit-geom");
+        let _ = std::fs::remove_file(&path);
+        app.store = crate::store::shared(Store::load_from(Some(path.clone())));
+        let g = geometry::WindowGeometry {
+            x: 10.0,
+            y: 20.0,
+            w: 800.0,
+            h: 150.0,
+        };
+        app.last_source_geom = Some(g);
+        app.last_translation_geom = Some(g);
+        app.last_control_geom = Some(g);
+        assert!(!path.exists());
+        // Quitボタンは quit() を呼ぶ。on_exit を待たずに保存する
+        let ctx = egui::Context::default();
+        let _ = ctx.run(raw_input_with(vec![]), |ctx| {
+            app.quit(ctx);
+        });
+        let loaded = Store::load_from(Some(path.clone()));
+        assert_eq!(loaded.source(), Some(g));
+        assert_eq!(loaded.translation(), Some(g));
+        assert_eq!(loaded.control(), Some(g));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn control_close_saves_window_geometries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = test_app(rt.handle().clone());
+        let path = quit_scratch("close-geom");
+        let _ = std::fs::remove_file(&path);
+        app.store = crate::store::shared(Store::load_from(Some(path.clone())));
+        let g = geometry::WindowGeometry {
+            x: 30.0,
+            y: 40.0,
+            w: 320.0,
+            h: 440.0,
+        };
+        app.last_source_geom = Some(g);
+        app.last_translation_geom = Some(g);
+        app.last_control_geom = Some(g);
+        let ctx = egui::Context::default();
+        // 通常フレームでは書かない
+        let _ = ctx.run(raw_input_with(vec![]), |ctx| {
+            app.control_frame(ctx);
+        });
+        assert!(!path.exists());
+        // コントロール窓のバツで保存する
+        let _ = ctx.run(
+            raw_input_with(vec![egui::ViewportEvent::Close]),
+            |ctx| {
+                app.control_frame(ctx);
+            },
+        );
+        let loaded = Store::load_from(Some(path.clone()));
+        assert_eq!(loaded.source(), Some(g));
+        assert_eq!(loaded.translation(), Some(g));
+        assert_eq!(loaded.control(), Some(g));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1839,10 +3990,15 @@ mod tests {
         let mut clicked = true;
         let _ = ctx.run(raw_input_with(vec![]), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
+                let mut parts = [PaintPart {
+                    text: "hello",
+                    cache: &mut cache,
+                    color: egui::Color32::WHITE,
+                    strong: true,
+                }];
                 clicked = paint_subtitle_window(
                     ui,
-                    "hello",
-                    &mut cache,
+                    &mut parts,
                     egui::FontId::proportional(28.0),
                     false,
                     "drag",
@@ -1868,10 +4024,15 @@ mod tests {
                     let rect = ui.max_rect();
                     *out = egui::Pos2::new(rect.max.x - 17.0, rect.min.y + 12.0);
                 }
+                let mut parts = [PaintPart {
+                    text: "hello",
+                    cache,
+                    color: egui::Color32::WHITE,
+                    strong: true,
+                }];
                 paint_subtitle_window(
                     ui,
-                    "hello",
-                    cache,
+                    &mut parts,
                     egui::FontId::proportional(28.0),
                     true,
                     "drag",
